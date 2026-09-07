@@ -1,0 +1,6 @@
+# 依赖与数据不入库
+_vendor/
+output/
+test_output/
+__pycache__/
+*.pyc

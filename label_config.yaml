@@ -1,0 +1,81 @@
+# label_config.yaml — 标注标签体系与句子模板（可自由增删，无需改代码）
+#
+# 结构：
+#   features: 特征列表，标注界面按此顺序逐个呈现
+#     - name:    特征显示名（界面与句子模板中引用）
+#       key:     存入 JSONL 的字段名（英文，建议不改）
+#       bbox:    （可选）true 表示该特征除类别外还需标注一个矩形范围框（写入记录 regions 字段）
+#       bbox_color: （可选）框在显示图上的叠加颜色，如 "#ff0000"
+#       options: 可选项列表
+#         - label:  界面上显示/存储的选项名
+#           phrase: （可选）拼句子时用的措辞，缺省用 label
+#           hotkey: （可选）数字快捷键，缺省按顺序 1..9
+#   sentence_template: 用 {特征显示名} 引用各特征所选选项的 phrase
+#
+# 注：不设「不确定」选项（用户决策：不确定标签不利于分类任务训练）。
+
+features:
+  - name: 集合类型
+    key: gather_type
+    options:
+      - label: 炮集
+      - label: CMP道集
+      - label: 共检波点道集
+      - label: 残差
+      - label: 其他
+
+  - name: 静校正
+    key: statics
+    options:
+      - label: 需要
+        phrase: 需要静校正
+      - label: 不需要
+        phrase: 不需要静校正
+
+  - name: 直达波
+    key: direct_wave
+    options:
+      - label: 存在
+      - label: 不存在
+      - label: 已压制但有残留
+
+  - name: 面波
+    key: surface_wave
+    bbox: true
+    bbox_color: "#ff0000"
+    options:
+      - label: 存在
+      - label: 不存在
+      - label: 已压制但有残留
+
+  - name: 异常振幅
+    key: abnormal_amplitude
+    options:
+      - label: 存在
+      - label: 不存在
+      - label: 已压制但有残留
+
+  - name: 50Hz工业噪声
+    key: industrial_50hz
+    options:
+      - label: 存在
+      - label: 不存在
+      - label: 已压制但有残留
+
+  - name: 近炮点强能量噪声
+    key: near_shot_noise
+    bbox: true
+    bbox_color: "#ffff00"
+    options:
+      - label: 存在
+      - label: 不存在
+      - label: 已压制但有残留
+
+  - name: 混叠噪声
+    key: aliasing_noise
+    options:
+      - label: 存在
+      - label: 不存在
+      - label: 已压制但有残留
+
+sentence_template: "这是一条{集合类型}，{静校正}，直达波{直达波}，面波{面波}，异常振幅{异常振幅}，50Hz工业噪声{50Hz工业噪声}，近炮点强能量噪声{近炮点强能量噪声}，混叠噪声{混叠噪声}。"
