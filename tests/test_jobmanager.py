@@ -4,10 +4,10 @@ import numpy as np
 # 让本文件能导入同目录的 segy_factory（python -m unittest tests.test_jobmanager 时 tests/ 不在 sys.path）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from segy_factory import write_sgy
+from segy_factory import write_sgy, _bin_header, HDR
 from gather import Gather
 from labels import LabelConfig
-from jobmanager import open_job, JobManager, finalize_regions
+from jobmanager import open_job, JobManager, JobError, finalize_regions
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CFG = LabelConfig(os.path.join(ROOT, "label_config.yaml"))
@@ -374,6 +374,77 @@ class TestCreateAndRestore(unittest.TestCase):
         ok, rec, err = m2.save(job.job_id, "ann1", claim["gid"], sel, boxes)
         self.assertTrue(ok, err)
         self.assertTrue(os.path.isfile(os.path.join(job.output_dir, rec["image_path"])))
+
+class TestCreateMinTraces(unittest.TestCase):
+    """建作业时按「道数下限」滤去道数过少的道集。"""
+
+    @staticmethod
+    def _write_var_sgy(path, counts, ns=64):
+        """造一个每道集道数不同的小端 sgy（95-96=炮号, 9-12=FFID, 13-16=道号）。"""
+        e = "<"
+        rows = []
+        gid = 0
+        for gv, c in enumerate(counts, start=1):
+            for t in range(c):
+                hdr = bytearray(HDR)
+                hdr[94:96] = np.array([gv], dtype=e + "i2").tobytes()
+                hdr[8:12] = np.array([37000 + gid], dtype=e + "i4").tobytes()
+                hdr[12:16] = np.array([t + 1], dtype=e + "i4").tobytes()
+                data = np.random.default_rng(gid).normal(size=ns).astype(np.float32)
+                rows.append(bytes(hdr) + data.tobytes())
+                gid += 1
+        import os
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"\x00" * 3200)
+            f.write(_bin_header(ns, sum(counts), "little"))
+            f.write(b"".join(rows))
+
+    def test_min_traces_filters_low_count_gathers(self):
+        root = tempfile.mkdtemp()
+        sgy = os.path.join(root, "v.sgy")
+        self._write_var_sgy(sgy, [2, 8])            # 炮1=2道，炮2=8道
+        jobs_root = os.path.join(root, "jobs")
+        m = JobManager(jobs_root, CFG)
+        job = m.create_job(sgy, [(95, 96), (13, 16)], [(95, 96)], [1, 2],
+                           clip=99, title="v", created_by="boss", min_traces=5)
+        ids = job.gather_ids()
+        self.assertEqual(len(ids), 1)               # 2道的炮1被滤去，只剩炮2
+        self.assertIn("_95-96_2", ids[0])
+        self.assertEqual(job.meta["min_traces"], 5)
+        # 重启恢复后仍按 min_traces 过滤
+        m2 = JobManager(jobs_root, CFG)
+        m2.load_all()
+        self.assertEqual(m2.list_jobs()[0]["total"], 1)
+
+    def test_min_traces_zero_keeps_all(self):
+        root = tempfile.mkdtemp()
+        sgy = os.path.join(root, "v.sgy")
+        self._write_var_sgy(sgy, [2, 8])
+        m = JobManager(os.path.join(root, "jobs"), CFG)
+        job = m.create_job(sgy, [(95, 96), (13, 16)], [(95, 96)], [1, 2],
+                           clip=99, title="v", created_by="boss", min_traces=0)
+        self.assertEqual(len(job.gather_ids()), 2)
+
+    def test_min_traces_too_high_raises(self):
+        root = tempfile.mkdtemp()
+        sgy = os.path.join(root, "v.sgy")
+        self._write_var_sgy(sgy, [2, 8])
+        m = JobManager(os.path.join(root, "jobs"), CFG)
+        with self.assertRaises(JobError):
+            m.create_job(sgy, [(95, 96), (13, 16)], [(95, 96)], [1, 2],
+                         clip=99, title="v", created_by="boss", min_traces=50)
+
+    def test_filter_min_traces_unit(self):
+        from jobmanager import JobManager as _J
+        gs = []
+        for k in (4, 8, 12, 3):
+            g = Gather(key="95-96", value=k, trace_indices=np.arange(k))
+            gs.append(g)
+        kept = _J._filter_min_traces(gs, 5)
+        self.assertEqual([g.n_traces for g in kept], [8, 12])   # 4、3 被滤
+        self.assertEqual(len(_J._filter_min_traces(gs, 0)), 4)  # 0=不过滤
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -196,29 +196,46 @@ class JobManager:
             g.prefix = stem
         return r, gs
 
+    @staticmethod
+    def _filter_min_traces(gs, min_traces):
+        """按道数下限滤去道集：保留 g.n_traces >= min_traces；min_traces<=0 不过滤。"""
+        try:
+            limit = int(min_traces or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit <= 0:
+            return gs
+        return [g for g in gs if g.n_traces >= limit]
+
     def _job_meta(self, job_id: str, title: str, path: str, endian: str,
                   sort_keys, extract_keys, values, clip: float, created_by: str,
-                  output_dir: str) -> dict:
+                  output_dir: str, min_traces: int = 0) -> dict:
         return {"job_id": job_id, "title": title, "source_file": os.path.abspath(path),
                 "endian": endian, "sort_keys": [list(k) for k in sort_keys],
                 "extract_keys": [list(k) for k in extract_keys],
                 "values": _json_values(values), "clip_percentile": float(clip),
+                "min_traces": int(min_traces or 0),
                 "created_by": created_by,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "state": "open", "output_dir": output_dir}
 
     def create_job(self, source_file: str, sort_keys, extract_keys, values,
                    clip: float, title: str, created_by: str,
-                   endian: str = "auto") -> Job:
-        """从真实 sgy 抽道集建作业：写 job.json + 注册。values: 单字段 list[int] / 多字段 list[tuple]"""
+                   endian: str = "auto", min_traces: int = 0) -> Job:
+        """从真实 sgy 抽道集建作业：写 job.json + 注册。values: 单字段 list[int] / 多字段 list[tuple]。
+        min_traces: 道数 < 该值的道集从任务池滤去（不标注）；0=不过滤。"""
         r, gs = self._extract(source_file, sort_keys, extract_keys, values, endian)
+        gs = self._filter_min_traces(gs, min_traces)
         if not gs:
-            raise JobError("没有抽到任何道集")
+            limit = int(min_traces or 0)
+            raise JobError(
+                "没有抽到任何道集" if limit <= 0 else f"抽到的道集道数都小于 {limit}，无可用道集")
         job_id = f"{os.path.splitext(os.path.basename(source_file))[0]}__{datetime.now():%Y%m%d%H%M%S}"
         output_dir = os.path.join(self.jobs_root, job_id)
         os.makedirs(output_dir, exist_ok=True)
         meta = self._job_meta(job_id, title, source_file, endian,
-                              sort_keys, extract_keys, values, clip, created_by, output_dir)
+                              sort_keys, extract_keys, values, clip, created_by, output_dir,
+                              min_traces=min_traces)
         with open(os.path.join(output_dir, "job.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         ns = r.info()["ns"]
@@ -246,6 +263,7 @@ class JobManager:
                     [tuple(x) for x in meta["sort_keys"]],
                     [tuple(x) for x in meta["extract_keys"]],
                     _restore_values(meta["values"]), meta.get("endian", "auto"))
+                gs = self._filter_min_traces(gs, meta.get("min_traces", 0))
                 job = self.register_job(meta, gs, r.info()["ns"],
                                         lambda g, r=r: r.get_traces(g.trace_indices))
             except Exception:

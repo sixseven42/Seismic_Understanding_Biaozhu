@@ -274,8 +274,8 @@ def _parse_job_values(sort_text: str, gkey_text: str, selected: list[str]):
 
 
 def create_job_ui(request: gr.Request, path, endian_text, sort_text, gkey_text,
-                  selected, clip, title):
-    """创建作业：抽一次道集、写 job.json、注册并刷新作业下拉。"""
+                  selected, clip, title, min_traces):
+    """创建作业：抽一次道集（可按道数下限滤去过少者）、写 job.json、注册并刷新下拉。"""
     user = _user(request)
     if not _is_admin(user):
         return "❌ 仅管理员可创建作业", gr.update(), gr.update()
@@ -291,15 +291,21 @@ def create_job_ui(request: gr.Request, path, endian_text, sort_text, gkey_text,
         return f"❌ {e}", gr.update(), gr.update()
     title = (title or "").strip() or os.path.splitext(os.path.basename(path))[0]
     try:
+        min_traces = int(min_traces) if min_traces else 0
+    except (TypeError, ValueError):
+        min_traces = 0
+    try:
         job = JM.create_job(path, sort_keys, gkeys, values,
                             float(clip if clip is not None else 99.0),
-                            title, user, endian=endian)
+                            title, user, endian=endian, min_traces=min_traces)
     except (JobError, SegyReadError) as e:
         return f"❌ {e}", gr.update(), gr.update()
     n = len(job.gather_ids())
+    dropped = max(0, len(values) - n) if min_traces > 0 else 0
+    note = f"（已滤去 {dropped} 个道数 < {min_traces} 的道集）" if dropped else ""
     job_choices = _job_choices(user)
     mgr_choices = [j["job_id"] for j in JM.list_jobs()]
-    return (f"✔ 已创建作业 {job.job_id}（键 {ranges_label(gkeys)}）｜道集数 {n}",
+    return (f"✔ 已创建作业 {job.job_id}（键 {ranges_label(gkeys)}）｜道集数 {n}{note}",
             gr.update(choices=job_choices, value=job.job_id),
             gr.update(choices=mgr_choices, value=job.job_id))
 
@@ -1007,6 +1013,9 @@ def build_app() -> gr.Blocks:
             with gr.Row():
                 clip = gr.Number(label="clip 分位数 (%)", value=99.0, minimum=50, maximum=100)
                 title = gr.Textbox(label="作业标题（可空，默认=文件名）")
+            with gr.Row():
+                min_traces = gr.Number(label="道数下限（道数 < 该值的道集不参与标注，0=不限）",
+                                       value=0, minimum=0, precision=0)
             btn_create = gr.Button("创建作业", variant="primary")
             build_info = gr.Markdown("")
 
@@ -1074,7 +1083,7 @@ def build_app() -> gr.Blocks:
         btn_load.click(load_file, [file_path, endian], file_info)
         btn_scan.click(scan_values, [file_path, endian, gkey], [values_box, scan_info])
         btn_create.click(create_job_ui,
-                         [file_path, endian, sort_keys, gkey, values_box, clip, title],
+                         [file_path, endian, sort_keys, gkey, values_box, clip, title, min_traces],
                          [build_info, job_dd, mgr_job_dd])
 
         anno_outputs = [cur_img, anno_info, sentence, *radios, *box_statuses]
