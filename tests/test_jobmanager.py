@@ -202,6 +202,110 @@ class TestImageExportOnlyOnSave(unittest.TestCase):
             os.path.abspath(os.path.join(self.out, "images"))))   # 显示图在 .cache，不在导出目录
 
 
+class TestSkip(unittest.TestCase):
+    """回归：跳过 = 当前道集回池（不写记录）+ 自动领取下一张（非刚跳过的那张）。"""
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.manager = JobManager(self.root, CFG)
+        self.out = os.path.join(self.root, "job1"); os.makedirs(self.out)
+        meta = meta_for("job1", self.out)
+        self.job = self.manager.register_job(meta, fake_gathers(), 200, fake_provider())
+
+    def test_skip_releases_and_claims_another(self):
+        first = self.manager.claim("job1", "ann1")["gid"]
+        out = self.manager.skip("job1", "ann1")
+        self.assertIsNotNone(out["gid"])
+        self.assertNotEqual(out["gid"], first)          # 自动领的是另一张
+        self.assertEqual(out["skipped"], first)
+        # 被跳过的那张回池、未标注：别人能领到
+        other = self.manager.claim("job1", "ann2")
+        self.assertEqual(other["gid"], first)
+        self.assertIsNone(self.manager.record("job1", first))   # 没有写记录
+
+    def test_skip_single_remaining_returns_it_back(self):
+        # 先标完两张，只剩第三张；ann2 持有它，跳过只能退回同一张（仍有任务可做）
+        sel = {f.name: ("不存在" if f.option_by_label("不存在") else f.options[0].label)
+               for f in CFG.features}
+        boxes = {f.key: {"xyxy": [1, 1, 2, 2], "traces": [0, 2], "samples": [0, 4]}
+                 for f in CFG.features if f.bbox}
+        for _ in range(2):
+            c = self.manager.claim("job1", "ann1")
+            ok, rec, err = self.manager.save("job1", "ann1", c["gid"], sel, boxes)
+            self.assertTrue(ok, err)
+        hold = self.manager.claim("job1", "ann2")      # 只剩最后一张，ann2 拿到
+        self.assertEqual(self.manager.progress("job1"), (2, 3))
+        out = self.manager.skip("job1", "ann2")
+        self.assertEqual(out["gid"], hold["gid"])      # 只有它，退回继续做
+        self.assertIsNone(self.manager.record("job1", hold["gid"]))
+
+
+    def test_repeated_skips_do_not_oscillate(self):
+        # 4 个未标注道集、单人连点跳过：应在不同的道集间推进，而不是 A<->B 循环
+        root = tempfile.mkdtemp()
+        mgr = JobManager(root, CFG)
+        out = os.path.join(root, "job1"); os.makedirs(out)
+        meta = meta_for("job1", out)
+        gs = []
+        for v in range(1, 5):
+            g = Gather(key="95-96", value=v, trace_indices=np.arange(40))
+            g.prefix = "fake__"
+            gs.append(g)
+        mgr.register_job(meta, gs, 200, fake_provider())
+        c0 = mgr.claim("job1", "ann1")["gid"]
+        s1 = mgr.skip("job1", "ann1")
+        s2 = mgr.skip("job1", "ann1")
+        self.assertEqual(s1["skipped"], c0)
+        self.assertIsNotNone(s1["gid"])
+        self.assertIsNotNone(s2["gid"])
+        self.assertNotEqual(s1["gid"], c0)
+        self.assertNotIn(s2["gid"], {c0, s1["gid"]})   # 第 3 次不再回到前两张
+
+    def test_skip_then_manual_claim_avoids_recently_skipped(self):
+        root = tempfile.mkdtemp()
+        mgr = JobManager(root, CFG)
+        out = os.path.join(root, "job1"); os.makedirs(out)
+        meta = meta_for("job1", out)
+        gs = []
+        for v in range(1, 5):
+            g = Gather(key="95-96", value=v, trace_indices=np.arange(40))
+            g.prefix = "fake__"
+            gs.append(g)
+        mgr.register_job(meta, gs, 200, fake_provider())
+        c0 = mgr.claim("job1", "ann1")["gid"]
+        mgr.skip("job1", "ann1")                        # 跳过 c0 → 拿到另一张
+        mgr.release("job1", "ann1")                     # 放掉当前这张后手动再领
+        again = mgr.claim("job1", "ann1")               # 不应马上领回刚跳过的 c0
+        self.assertIsNotNone(again["gid"])
+        self.assertNotEqual(again["gid"], c0)
+
+
+class TestDeleteJob(unittest.TestCase):
+    """软删除：从列表隐藏、不可领取；恢复后回到 open；本地文件保留。"""
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.manager = JobManager(self.root, CFG)
+        self.out = os.path.join(self.root, "job1"); os.makedirs(self.out)
+        meta = meta_for("job1", self.out)
+        self.manager.register_job(meta, fake_gathers(), 200, fake_provider())
+
+    def test_delete_hides_from_list_and_blocks_claim(self):
+        self.assertEqual([j["job_id"] for j in self.manager.list_jobs()], ["job1"])
+        self.manager.delete_job("job1")
+        self.assertEqual(self.manager.list_jobs(), [])                    # 列表隐藏
+        self.assertEqual([j["job_id"] for j in self.manager.deleted_jobs()], ["job1"])
+        out = self.manager.claim("job1", "ann1")
+        self.assertIsNone(out["gid"])                                     # 不可领取
+        self.assertTrue(os.path.isdir(self.out))                          # 本地文件保留
+
+    def test_restore_returns_job_and_allows_claim(self):
+        self.manager.delete_job("job1")
+        self.manager.restore_job("job1")
+        self.assertEqual([j["job_id"] for j in self.manager.list_jobs()], ["job1"])
+        self.assertEqual(self.manager.deleted_jobs(), [])
+        out = self.manager.claim("job1", "ann1")
+        self.assertIsNotNone(out["gid"])                                  # 恢复后可领取
+
+
 class TestClaimShuffledPool(unittest.TestCase):
     """回归：任务领取按打乱后的池下发，任一标注者拿到的是乱序道集，
     而不是按数据值连续的顺序段（避免标注疲劳）。"""

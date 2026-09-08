@@ -7,6 +7,7 @@ web_app.py 复用本模块，删除其本地重复定义。
 
 from __future__ import annotations
 
+import html
 import math
 
 # render_data_only 固定输出尺寸（宽×高，像素），与 imaging.py 默认一致。
@@ -38,3 +39,47 @@ def pixel_box_to_data(c0, c1, n_tr: int, ns: int) -> dict:
            "samples": [math.floor(y0 * ns / IMG_H),
                        min(ns, math.ceil((y1 + 1) * ns / IMG_H))]}
     return box
+
+
+_STATE_CN = {"open": "进行中", "closed": "已关闭", "broken": "异常"}
+
+
+def jobs_progress_html(jobs: list[dict]) -> str:
+    """作业进度一览表 HTML 片段（纯字符串，便于单测与定时刷新）。
+
+    jobs: JM.list_jobs() 的结构，每项含 job_id/title/state/labeled/total。
+    展示每作业：标题+ID、状态、已完成 x/总数 y、百分比、进度条；total=0 防除零。
+    """
+    rows = []
+    for j in jobs:
+        jid = html.escape(str(j.get("job_id") or ""))
+        title = html.escape(str(j.get("title") or "") or jid)
+        state = str(j.get("state") or "")
+        try:
+            lab = int(j.get("labeled") or 0)
+            tot = int(j.get("total") or 0)
+        except (TypeError, ValueError):
+            lab = tot = 0
+        pct_i = int(round(lab / tot * 100)) if tot else 0
+        state_txt = html.escape(_STATE_CN.get(state, state))
+        if tot and lab >= tot:
+            bar_cls = "jp-done"
+        elif state == "closed":
+            bar_cls = "jp-close"
+        else:
+            bar_cls = "jp-run"
+        rows.append(
+            "<tr>"
+            f"<td class='jp-title'>{title}<span class='jp-id'>{jid}</span></td>"
+            f"<td class='jp-state'>{state_txt}</td>"
+            f"<td class='jp-count'>{lab} / {tot}</td>"
+            f"<td class='jp-pct'>{pct_i}%</td>"
+            f"<td class='jp-bar'><div class='jp-bg'><div class='{bar_cls}' "
+            f"style='width:{min(100, max(0, pct_i))}%'></div></div></td>"
+            "</tr>"
+        )
+    if not rows:
+        return "<p class='jp-empty'>暂无作业</p>"
+    head = ("<table class='jobs-progress'>"
+            "<tr><th>作业</th><th>状态</th><th>已完成</th><th>进度</th><th></th></tr>")
+    return head + "".join(rows) + "</table>"

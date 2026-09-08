@@ -18,10 +18,13 @@ import argparse
 import os
 import tempfile
 import threading
+import time
 
 import gradio as gr
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
 
-from web_core import fmt_option, label_of, pixel_box_to_data
+from web_core import fmt_option, jobs_progress_html, label_of, pixel_box_to_data
 from labels import LabelConfig
 from users import Accounts
 from jobmanager import JobManager, JobError
@@ -158,7 +161,7 @@ def box_statuses_of(request: gr.Request) -> list[str]:
     outs = []
     for feat in bbox_feats():
         if st.get("box_mode") == feat.key:
-            outs.append("👉 框选中：" + ("请点击对角" if st.get("pending_corner") else "请点击第一个角点"))
+            outs.append("👉 框选中：请在图上按住鼠标拖动，松开即确定")
             continue
         b = boxes.get(feat.key)
         if b:
@@ -366,7 +369,7 @@ def enter_box_mode(request: gr.Request, feat_key: str):
     st["box_mode"] = feat_key
     st["pending_corner"] = None
     feat = next(f for f in bbox_feats() if f.key == feat_key)
-    return (f"👉 正在框选「{feat.name}」：请在左侧图上点击第一个角点", *box_statuses_of(request))
+    return (f"👉 正在框选「{feat.name}」：请在图上按住鼠标拖动，松开即确定", *box_statuses_of(request))
 
 
 def clear_box(request: gr.Request, feat_key: str):
@@ -386,29 +389,27 @@ def clear_box(request: gr.Request, feat_key: str):
     return (render_display(request), f"已清除「{feat.name}」的框", *box_statuses_of(request))
 
 
-def on_img_select(request: gr.Request, evt: gr.SelectData):
-    """图上点击：框选模式下依次记录两个角点。"""
-    user = _user(request)
-    st = wstate(user)
-    if not st.get("gid") or not st.get("job_id"):
-        return (gr.skip(), "⚠️ 请先领取道集", *(["…"] * len(bbox_feats())))
-    JM.renew(st["job_id"], user)
-    if st.get("box_mode") is None:
-        return (gr.skip(), "（先在特征下方点「▣ 框选」，再在图上取点）", *box_statuses_of(request))
-    x, y = float(evt.index[0]), float(evt.index[1])
-    if st.get("pending_corner") is None:
-        st["pending_corner"] = (x, y)
-        return (gr.skip(), f"已记录第一个角点 ({int(x)},{int(y)})，请点击对角", *box_statuses_of(request))
-    job = JM.get(st["job_id"])
-    g = job.gather(st["gid"])
-    box = pixel_box_to_data(st["pending_corner"], (x, y), g.n_traces, job.ns)
-    feat = next(f for f in bbox_feats() if f.key == st["box_mode"])
-    boxes = _current_boxes(job, st["gid"], st)
-    boxes[feat.key] = box
-    st["boxes"] = boxes
-    st["box_mode"] = None
-    st["pending_corner"] = None
-    return (render_display(request), f"✔「{feat.name}」框选完成", *box_statuses_of(request))
+def apply_drag_box(user: str, key: str, x0, y0, x1, y1) -> tuple[bool, str]:
+    """把「拖动框选」的最终矩形写入该用户当前道集的 boxes（真实像素坐标 512×1024）。
+
+    由自定义接口 /api/anno_box 调用（前端鼠标松开即提交）；保存/校验继续读 st['boxes']。
+    """
+    if key not in [f.key for f in bbox_feats()]:
+        return False, f"非框选特征: {key}"
+    with WORK_LOCK:
+        st = WORK.setdefault(user, {})
+        if not st.get("job_id") or not st.get("gid"):
+            return False, "没有正在标注的道集"
+        job = JM.get(st["job_id"])
+        g = job.gather(st["gid"])
+    box = pixel_box_to_data((float(x0), float(y0)), (float(x1), float(y1)),
+                            g.n_traces, job.ns)
+    with WORK_LOCK:
+        st["boxes"] = dict(st.get("boxes") or {})
+        st["boxes"][key] = box
+        st["box_mode"] = None
+        st["pending_corner"] = None
+    return True, key
 
 
 def save_anno(request: gr.Request, *radio_values):
@@ -482,6 +483,45 @@ def release_current(request: gr.Request):
     st["pending_corner"] = None
     return (gr.update(value=None), "已归还当前道集（回池，可被他人领取）", "",
             *([gr.Radio(value=None)] * len(CFG.features)), *(["…"] * len(bbox_feats())))
+
+
+def skip_current(request: gr.Request):
+    """「跳过此张」：当前道集放回池（不写记录、不计完成），并自动领取下一张。"""
+    user = _user(request)
+    st = wstate(user)
+    if not st.get("job_id") or not st.get("gid"):
+        return _anno_idle("⚠️ 没有正在标注的道集")
+    job_id = st["job_id"]
+    out = JM.skip(job_id, user)
+    if out.get("gid"):
+        st["gid"] = out["gid"]
+        st["partial"], st["boxes"] = {}, {}
+        st["box_mode"] = None
+        st["pending_corner"] = None
+        cur = show_current(request)
+        skipped = out.get("skipped")
+        return (cur[0],
+                f"⏭ 已跳过「{skipped or '当前道集'}」回池（未保存）｜自动领取下一张",
+                cur[2], *cur[3:])
+    n_labeled, total = JM.progress(job_id)
+    if n_labeled >= total:
+        return (gr.update(value=None),
+                f"🎉 本作业已全部标注（{n_labeled}/{total}）",
+                "", *([gr.Radio(value=None)] * len(CFG.features)),
+                *(["…"] * len(bbox_feats())))
+    return _anno_idle("⚠️ " + (out.get("reason") or "暂无剩余可领取"))
+
+
+def refresh_jobs_progress():
+    """管理区定时刷新：返回(进度表HTML, 删除按钮, 删除提示)。
+
+    顺带清理“删除确认”超时态：约 3 秒未再点则自动复原按钮/提示。
+    """
+    html = jobs_progress_html(JM.list_jobs())
+    if _PENDING_DELETE["job_id"] and time.time() - _PENDING_DELETE["at"] > 3.0:
+        _cancel_delete()
+        return (html, gr.update(value="🗑 删除作业"), gr.update(value=""))
+    return (html, gr.update(), gr.update())
 
 
 def reopen_mine(request: gr.Request, job_id: str, gid: str):
@@ -573,19 +613,99 @@ def resync_job(request: gr.Request, job_id: str):
     return f"✔ 已入队重传 {job_id}（images/*.png + labels.jsonl）"
 
 
-def toggle_job(request: gr.Request, job_id: str):
+def _mgmt_choices() -> list[str]:
+    return [j["job_id"] for j in JM.list_jobs()]
+
+def _deleted_choices() -> list[str]:
+    return [j["job_id"] for j in JM.deleted_jobs()]
+
+def _job_title(job_id: str) -> str:
+    try:
+        return JM.get(job_id).title or job_id
+    except JobError:
+        return job_id
+
+
+# 「删除作业」两次确认的临时态（内存，进程内有效）
+_PENDING_DELETE: dict = {"job_id": None, "at": 0.0}
+
+
+def _cancel_delete():
+    _PENDING_DELETE["job_id"] = None
+    _PENDING_DELETE["at"] = 0.0
+
+
+def _del_pack(btn_label: str, info: str, user: str, mgr_value):
+    """删除按钮输出组（顺序与 del_outputs 一致）。"""
+    return (gr.update(value=btn_label),
+            info,
+            gr.update(choices=_mgmt_choices(), value=mgr_value),
+            gr.update(choices=_deleted_choices(), value=None),
+            jobs_progress_html(JM.list_jobs()),
+            gr.update(choices=_job_choices(user), value=None))
+
+
+def delete_job_click(request: gr.Request, job_id: str):
+    """删除作业：首次点击进入确认态，3 秒内再点一次才真正软删除。"""
     user = _user(request)
     if not _is_admin(user):
-        return "❌ 仅管理员可操作"
+        return _del_pack("🗑 删除作业", "❌ 仅管理员可删除", user, None)
+    job_id = (job_id or "").strip()
     if not job_id:
-        return "⚠️ 请选择作业"
+        return _del_pack("🗑 删除作业", "⚠️ 请先选择要删除的作业", user, None)
+    title = _job_title(job_id)
+    armed = (_PENDING_DELETE["job_id"] == job_id
+             and time.time() - _PENDING_DELETE["at"] <= 3.0)
+    if not armed:
+        _cancel_delete()
+        _PENDING_DELETE["job_id"] = job_id
+        _PENDING_DELETE["at"] = time.time()
+        return _del_pack("⚠️ 再次点击确认删除",
+                         f"⚠️ 再点一次确认删除「{title}」（{job_id}）；"
+                         f"约 3 秒未确认或换选其它作业会自动取消。本地结果不会删除。",
+                         user, job_id)
     try:
-        job = JM.get(job_id)
-        new_state = "closed" if job.state == "open" else "open"
-        JM.set_state(job_id, new_state)
+        JM.delete_job(job_id)
     except JobError as e:
-        return f"❌ {e}"
-    return f"✔ 作业 {job_id} 已{'关闭' if new_state == 'closed' else '打开'}"
+        _cancel_delete()
+        return _del_pack("🗑 删除作业", f"❌ {e}", user, None)
+    _cancel_delete()
+    return _del_pack("🗑 删除作业",
+                     f"✔ 已删除「{title}」→ 移入“已删除作业”（本地文件保留，可恢复）",
+                     user, None)
+
+
+def restore_job_click(request: gr.Request, job_id: str):
+    """把已软删除的作业恢复为进行中。"""
+    user = _user(request)
+    if not _is_admin(user):
+        return ("❌ 仅管理员可恢复",
+                gr.update(choices=_mgmt_choices(), value=None),
+                gr.update(choices=_deleted_choices(), value=None),
+                jobs_progress_html(JM.list_jobs()),
+                gr.update(choices=_job_choices(user), value=None))
+    job_id = (job_id or "").strip()
+    if not job_id:
+        return ("⚠️ 请先选择要恢复的作业",
+                gr.update(choices=_mgmt_choices(), value=None),
+                gr.update(choices=_deleted_choices(), value=None),
+                jobs_progress_html(JM.list_jobs()),
+                gr.update(choices=_job_choices(user), value=None))
+    title = _job_title(job_id)
+    try:
+        JM.restore_job(job_id)
+    except JobError as e:
+        return (f"❌ {e}",
+                gr.update(choices=_mgmt_choices(), value=None),
+                gr.update(choices=_deleted_choices(), value=None),
+                jobs_progress_html(JM.list_jobs()),
+                gr.update(choices=_job_choices(user), value=None))
+    _cancel_delete()
+    return (f"✔ 已恢复「{title}」为进行中，回到作业列表",
+            gr.update(choices=_mgmt_choices(), value=None),
+            gr.update(choices=_deleted_choices(), value=None),
+            jobs_progress_html(JM.list_jobs()),
+            gr.update(choices=_job_choices(user), value=None))
 
 
 # ----------------------------------------------------------------------
@@ -628,11 +748,13 @@ def init_page(request: gr.Request):
     user = _user(request)
     admin = _is_admin(user)
     mgr_choices = [j["job_id"] for j in JM.list_jobs()] if admin else []
+    del_choices = [j["job_id"] for j in JM.deleted_jobs()] if admin else []
     return (gr.update(choices=_job_choices(user), value=None),
             gr.update(visible=admin),      # 建作业区
             gr.update(visible=admin),      # 管理区
             gr.update(choices=mgr_choices, value=None),
-            gr.update(value=_who_md(user)))   # 账号栏
+            gr.update(value=_who_md(user)),   # 账号栏
+            gr.update(choices=del_choices, value=None))   # 已删除作业（可恢复）
 
 
 def _box_enter(key: str):
@@ -670,7 +792,189 @@ ANNO_CSS = """
     max-width: 100%; max-height: 100%;
     object-fit: contain; display: block;
 }
+
+/* 管理区作业进度一览表 */
+.jobs-progress { width: 100%; border-collapse: collapse; font-size: 13px; margin: 6px 0; }
+.jobs-progress th, .jobs-progress td {
+    border-bottom: 1px solid var(--border-color-primary);
+    padding: 4px 8px; text-align: left; vertical-align: middle;
+}
+.jobs-progress th { font-weight: 600; }
+.jobs-progress .jp-id { display: block; font-size: 11px; opacity: .6; }
+.jobs-progress .jp-state, .jobs-progress .jp-count, .jobs-progress .jp-pct {
+    white-space: nowrap;
+}
+.jp-bar { width: 30%; }
+.jp-bg { background: var(--border-color-primary); border-radius: 8px;
+         height: 10px; min-width: 120px; }
+.jp-bg > div { height: 10px; border-radius: 8px; }
+.jp-run { background: #2563eb; }
+.jp-done { background: #16a34a; }
+.jp-close { background: #9ca3af; }
+.jp-empty { color: var(--body-text-color-subdued); }
 """
+
+# 拖动框选：bbox 特征配置（key/名称/颜色），供前端注入 JS 使用
+_DRAG_BBOX = [[f.key, f.name, f.bbox_color] for f in CFG.features if f.bbox]
+
+ANNO_JS = """
+<style>
+#anno_imgcol .image-container { position: relative; }
+#anno_drag_canvas {
+    position: absolute; pointer-events: none; z-index: 50;
+    image-rendering: auto; border: 0; touch-action: none;
+}
+#anno_drag_canvas.active { pointer-events: auto; cursor: crosshair; }
+</style>
+<script>
+(function(){
+  const BBOX = __DRAG_BBOX__;
+  const KEY2COLOR = {}; BBOX.forEach(function(b){ KEY2COLOR[b[0]] = b[2] || '#ff0000'; });
+  let activeFeat = null;            // 正在框选的特征；null=画布不拦截指针
+  const committed = {};             // 已提交矩形: key -> {x0,y0,x1,y1}（每个特征一个）
+  let dragging = false, startPt = null, curPt = null;
+  let canvas = null, bound = false, lastSrc = '';
+
+  function getWrap(){ return document.querySelector('#anno_imgcol .image-container'); }
+  function getImg(){
+    var im = document.querySelector('#anno_imgcol .image-container img');
+    return (im && im.complete && im.naturalWidth) ? im : null;
+  }
+  function ensureCanvas(){
+    var w = getWrap(); if (!w) return null;
+    var cv = document.getElementById('anno_drag_canvas');
+    if (!cv){ cv = document.createElement('canvas'); cv.id = 'anno_drag_canvas'; w.appendChild(cv); }
+    if (!bound && cv){
+      cv.addEventListener('pointerdown', onDown);
+      cv.addEventListener('pointermove', onMove);
+      cv.addEventListener('pointerup', onUp);
+      cv.addEventListener('pointercancel', onUp);
+      bound = true;
+    }
+    return cv;
+  }
+  function clearPixels(){
+    if (!canvas) return;
+    var c = canvas.getContext('2d'); c.clearRect(0,0,canvas.width,canvas.height);
+  }
+  function redraw(){
+    clearPixels();
+    if (!canvas || !canvas._img || !canvas._rect) return;
+    var N = canvas._img, r = canvas._rect;
+    var c = canvas.getContext('2d'); c.lineWidth = 3; c.setLineDash([]);   // 粗实线
+    for (var key in committed){
+      var box = committed[key];
+      var px = box.x0/N.naturalWidth*r.width, py = box.y0/N.naturalHeight*r.height;
+      var pw = (box.x1-box.x0)/N.naturalWidth*r.width, ph = (box.y1-box.y0)/N.naturalHeight*r.height;
+      c.strokeStyle = KEY2COLOR[key] || '#1f6feb';
+      c.strokeRect(px, py, pw, ph);
+    }
+  }
+  function place(){
+    var w = getWrap(), img = getImg();
+    canvas = ensureCanvas();
+    if (!canvas) return;
+    if (!w || !img){ canvas.style.display = 'none'; return; }
+    if (img.currentSrc && img.currentSrc !== lastSrc){
+      lastSrc = img.currentSrc;          // 换了道集 → 清掉旧矩形
+      for (var k in committed) delete committed[k];
+    }
+    var cr = w.getBoundingClientRect(), ir = img.getBoundingClientRect();
+    canvas.style.display = '';
+    canvas.style.left = (ir.left - cr.left) + 'px';
+    canvas.style.top  = (ir.top  - cr.top)  + 'px';
+    canvas.style.width  = Math.round(ir.width) + 'px';
+    canvas.style.height = Math.round(ir.height) + 'px';
+    canvas.width  = Math.round(ir.width);
+    canvas.height = Math.round(ir.height);
+    canvas._img = img; canvas._rect = ir;
+    canvas.classList.toggle('active', !!activeFeat);
+    redraw();
+  }
+  function toNat(p){
+    if (!canvas._img || !canvas._rect) return null;
+    var r = canvas._rect;
+    var nx = (p.x - r.left) / r.width  * canvas._img.naturalWidth;
+    var ny = (p.y - r.top)  / r.height * canvas._img.naturalHeight;
+    return [Math.max(0, Math.min(canvas._img.naturalWidth-1, nx)),
+            Math.max(0, Math.min(canvas._img.naturalHeight-1, ny))];
+  }
+  function drawLive(){
+    clearPixels(); redraw();            // 先画已提交，再叠当前虚线
+    if (!startPt || !curPt || !canvas._img || !canvas._rect) return;
+    var a = toNat(startPt), b = toNat(curPt); if (!a || !b) return;
+    var N = canvas._img, r = canvas._rect;
+    var sx = Math.min(a[0],b[0]), sy = Math.min(a[1],b[1]), ex = Math.max(a[0],b[0]), ey = Math.max(a[1],b[1]);
+    var px = sx/N.naturalWidth*r.width, py = sy/N.naturalHeight*r.height;
+    var pw = (ex-sx)/N.naturalWidth*r.width, ph = (ey-sy)/N.naturalHeight*r.height;
+    var c = canvas.getContext('2d');
+    c.strokeStyle = KEY2COLOR[activeFeat] || '#1f6feb';
+    c.lineWidth = 3; c.setLineDash([]);   // 拖动中也是粗实线
+    c.strokeRect(px, py, pw, ph);
+  }
+  function onDown(e){
+    if (!activeFeat) return;
+    dragging = true; startPt = {x:e.clientX, y:e.clientY}; curPt = startPt;
+    if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
+    drawLive(); e.preventDefault();
+  }
+  function onMove(e){ if (!dragging) return; curPt = {x:e.clientX, y:e.clientY}; drawLive(); e.preventDefault(); }
+  function onUp(e){
+    if (!dragging) return; dragging = false;
+    curPt = {x:e.clientX, y:e.clientY};
+    var a = toNat(startPt), b = toNat(curPt); startPt = curPt = null;
+    if (a && b){
+      var key = activeFeat;
+      committed[key] = { x0: Math.round(Math.min(a[0],b[0])), y0: Math.round(Math.min(a[1],b[1])),
+                         x1: Math.round(Math.max(a[0],b[0])), y1: Math.round(Math.max(a[1],b[1])) };
+      activeFeat = null;                       // 提交后不再拦截（防误拖覆盖）
+      canvas.classList.remove('active');
+      var user = currentUser();
+      if (user){
+        var box = committed[key];
+        fetch('/api/anno_box', { method:'POST', headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({user:user, key:key, x0:box.x0, y0:box.y0, x1:box.x1, y1:box.y1}) })
+          .catch(function(){});
+      }
+    }
+    redraw();
+  }
+  function currentUser(){
+    var md = document.getElementById('who_md'); var t = md ? (md.textContent||'') : '';
+    var m = t.match(/`([^`]+)`/); return m ? m[1] : null;
+  }
+  function setActive(key){ activeFeat = key; place(); }
+  function clearKey(key){ activeFeat = null; delete committed[key]; place(); }
+  function setup(){
+    document.addEventListener('click', function(e){
+      var t = e.target && e.target.closest ? e.target.closest('[id^="bb-"]') : null;
+      if (t){ var k = (t.id || '').replace(/^bb-/, ''); if (KEY2COLOR[k] !== undefined) setActive(k); }
+    });
+    document.addEventListener('click', function(e){
+      var t = e.target && e.target.closest ? e.target.closest('[id^="cb-"]') : null;
+      if (t){ var k = (t.id || '').replace(/^cb-/, ''); if (KEY2COLOR[k] !== undefined) clearKey(k); }
+    });
+    window.addEventListener('resize', function(){ if (!dragging) place(); });
+    // 监听持久存在的 #anno_imgcol 列：领取道集 / 图 src 变化 / 组件重挂载都会触发重定位
+    var root = document.getElementById('anno_imgcol') || document.body;
+    if (window.MutationObserver){
+      new MutationObserver(function(){ if (!dragging) place(); })
+        .observe(root, { childList:true, subtree:true, attributes:true, attributeFilter:['src','class'] });
+    }
+    window.addEventListener('load', function(ev){
+      if (ev.target && ev.target.tagName === 'IMG' && ev.target.closest && ev.target.closest('#anno_imgcol')) place();
+    }, true);
+    place();
+  }
+  var tries = 0;
+  var iv = setInterval(function(){
+    tries++;
+    if (document.getElementById('anno_imgcol')){ clearInterval(iv); setup(); }
+    else if (tries > 80) clearInterval(iv);
+  }, 400);
+})();
+</script>
+""".replace("__DRAG_BBOX__", str(_DRAG_BBOX))
 
 
 def build_app() -> gr.Blocks:
@@ -682,7 +986,7 @@ def build_app() -> gr.Blocks:
 
         # ---------- 账号栏（登出 / 切换账号） ----------
         with gr.Row():
-            who = gr.Markdown("正在加载账号…", scale=4)
+            who = gr.Markdown("正在加载账号…", scale=4, elem_id="who_md")
             btn_logout = gr.Button("登出 / 切换账号", scale=1)
 
         # ---------- ① 建作业（仅管理员可见，服务端校验为准） ----------
@@ -711,6 +1015,7 @@ def build_app() -> gr.Blocks:
             with gr.Row():
                 job_dd = gr.Dropdown(choices=[], label="作业", scale=3)
                 btn_claim = gr.Button("领取下一张", variant="primary", scale=1)
+                btn_skip = gr.Button("⏭ 跳过此张", scale=1)
                 btn_release = gr.Button("归还此张", scale=1)
                 btn_refresh = gr.Button("刷新", scale=1)
             with gr.Row():
@@ -722,7 +1027,7 @@ def build_app() -> gr.Blocks:
             box_buttons = []   # (feature_key, 框选按钮, 清除按钮)
             with gr.Row(elem_id="anno_body"):
                 with gr.Column(scale=3, elem_id="anno_imgcol", min_width=0):
-                    cur_img = gr.Image(label="当前道集（点「▣ 框选」后在图上点两个对角画框）",
+                    cur_img = gr.Image(label="当前道集（点「▣ 框选」后按住鼠标拖动框选）",
                                        type="filepath", height=640)
                 with gr.Column(scale=2, elem_id="anno_featcol", min_width=0):
                     sentence = gr.Textbox(label="句子预览", interactive=False, lines=3)
@@ -736,8 +1041,10 @@ def build_app() -> gr.Blocks:
                                     radios.append(r)
                                     if feat.bbox:
                                         with gr.Row():
-                                            btn_box = gr.Button(f"▣ 框选{feat.name}", size="sm")
-                                            btn_clear = gr.Button("✕ 清除", size="sm")
+                                            btn_box = gr.Button(f"▣ 框选{feat.name}", size="sm",
+                                                                 elem_id=f"bb-{feat.key}")
+                                            btn_clear = gr.Button("✕ 清除", size="sm",
+                                                                  elem_id=f"cb-{feat.key}")
                                         box_statuses.append(gr.Markdown("未画框"))
                                         box_buttons.append((feat.key, btn_box, btn_clear))
             btn_save = gr.Button("保存并释放", variant="primary")
@@ -747,14 +1054,21 @@ def build_app() -> gr.Blocks:
             with gr.Row():
                 mgr_job_dd = gr.Dropdown(choices=[], label="作业", scale=3)
                 btn_resync = gr.Button("全部重传", scale=1)
-                btn_toggle = gr.Button("打开/关闭作业", scale=1)
+                btn_delete = gr.Button("🗑 删除作业", scale=1)
             resync_info = gr.Markdown("")
-            toggle_info = gr.Markdown("")
+            del_info = gr.Markdown("")
+            gr.Markdown("**作业进度一览**（每 5 秒自动刷新）")
+            mgr_progress = gr.HTML(jobs_progress_html(JM.list_jobs()))
+            with gr.Row():
+                del_job_dd = gr.Dropdown(choices=[], label="已删除作业（本地保留，可恢复）",
+                                         scale=3)
+                btn_restore = gr.Button("♻ 恢复此作业", scale=1)
             gr.Markdown("**账号管理**：编辑项目根目录 `users.yaml`（增删用户/改角色），"
                         "下一次登录即生效，无需重启服务。")
 
         # ---------------- 事件 ----------------
-        demo.load(init_page, None, [job_dd, admin_build, admin_mgr, mgr_job_dd, who])
+        demo.load(init_page, None,
+                  [job_dd, admin_build, admin_mgr, mgr_job_dd, who, del_job_dd])
         btn_logout.click(logout_click, None, who)
 
         btn_load.click(load_file, [file_path, endian], file_info)
@@ -767,6 +1081,7 @@ def build_app() -> gr.Blocks:
         job_dd.change(open_job_for, job_dd, anno_outputs + [mine_dd])
         mine_dd.change(reopen_mine, [job_dd, mine_dd], anno_outputs)
         btn_claim.click(claim_next, job_dd, anno_outputs)
+        btn_skip.click(skip_current, None, anno_outputs)
         btn_release.click(release_current, None, anno_outputs)
         btn_refresh.click(refresh_page, None, [job_dd, mine_dd, *anno_outputs])
         btn_save.click(save_anno, radios, anno_outputs)
@@ -777,10 +1092,19 @@ def build_app() -> gr.Blocks:
         for key, btn_box, btn_clear in box_buttons:
             btn_box.click(_box_enter(key), None, [anno_info, *box_statuses])
             btn_clear.click(_box_clear(key), None, [cur_img, anno_info, *box_statuses])
-        cur_img.select(on_img_select, None, [cur_img, anno_info, *box_statuses])
 
         btn_resync.click(resync_job, mgr_job_dd, resync_info)
-        btn_toggle.click(toggle_job, mgr_job_dd, toggle_info)
+        btn_delete.click(delete_job_click, mgr_job_dd,
+                         [btn_delete, del_info, mgr_job_dd, del_job_dd,
+                          mgr_progress, job_dd])
+        btn_restore.click(restore_job_click, del_job_dd,
+                          [del_info, mgr_job_dd, del_job_dd, mgr_progress, job_dd])
+
+        # 管理区作业进度/删除确认：每 5 秒自动刷新（表仅放在 admin 可见的管理区）
+        gr.Timer(value=5).tick(refresh_jobs_progress,
+                               outputs=[mgr_progress, btn_delete, del_info],
+                               api_name=False, show_progress="hidden")
+    demo.queue(default_concurrency_limit=16)
     return demo
 
 
@@ -793,10 +1117,35 @@ def main():
                          "局域网 0.0.0.0:port 不受影响，两者同时可用（需本机能出网到 HuggingFace）")
     args = ap.parse_args()
     demo = build_app()
-    demo.launch(auth=ACC.authenticate, server_name=args.host, server_port=args.port,
-                share=args.share, css=ANNO_CSS,
-                auth_message="多用户地震标注服务：使用 users.yaml 中的账号登录；"
-                             "登录后点右上角「登出 / 切换账号」即可换账号。")
+    if args.share:
+        print("注：--share 公网隧道在此版本不启用（拖动框选依赖自定义接口），仍监听局域网端口。")
+    import uvicorn
+
+    app = FastAPI()
+
+    @app.post("/api/anno_box")
+    async def anno_box(req: Request):
+        try:
+            p = await req.json()
+        except Exception:
+            return JSONResponse({"ok": False, "err": "bad json"}, status_code=400)
+        user = str(p.get("user") or "").strip()
+        if not user or ACC.role(user) is None:
+            return JSONResponse({"ok": False, "err": "unknown user"}, status_code=401)
+        try:
+            ok, msg = apply_drag_box(user,
+                                     str(p.get("key") or ""),
+                                     float(p.get("x0")), float(p.get("y0")),
+                                     float(p.get("x1")), float(p.get("y1")))
+        except Exception as e:                       # noqa: BLE001 —— 统一转 400 提示
+            return JSONResponse({"ok": False, "err": str(e)}, status_code=400)
+        return {"ok": ok, "msg": msg}
+
+    gr.mount_gradio_app(app, demo, path="/", auth=ACC.authenticate, css=ANNO_CSS,
+                        head=ANNO_JS,
+                        auth_message="多用户地震标注服务：使用 users.yaml 中的账号登录；"
+                                     "登录后点右上角「登出 / 切换账号」即可换账号。")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 
 if __name__ == "__main__":

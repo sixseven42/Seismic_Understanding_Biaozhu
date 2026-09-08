@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 import json, os, random, tempfile, threading, time
+from collections import deque
 from datetime import datetime
 import numpy as np
 
@@ -151,6 +152,9 @@ class JobManager:
         self._jobs: dict[str, Job] = {}
         self._order: list[str] = []
         self._leases: dict[str, dict[str, list]] = {}   # job_id -> {gid: [user, deadline_ts]}
+        # job_id -> {user: deque[gid]}：用户近期「跳过」的道集，发任务时对本用户避让，
+        # 避免同一标注者反复在两个道集间循环跳过（只在对其没有其它任务时才退回）。
+        self._skipq: dict[str, dict[str, deque]] = {}
         self._locks: dict[str, threading.RLock] = {}
         self._lock = threading.RLock()                  # 注册表级
         self._readers: dict[tuple, object] = {}         # (abspath,endian) -> SegyReader
@@ -264,6 +268,10 @@ class JobManager:
     def _leases_of(self, job_id: str) -> dict:
         return self._leases.setdefault(job_id, {})
 
+    def _skip_list(self, job_id: str, user: str) -> deque:
+        """user 在该作业的近期跳过队列（deque<gid>，只在本用户发任务时避让）。"""
+        return self._skipq.setdefault(job_id, {}).setdefault(user, deque())
+
     def current(self, job_id: str, user: str) -> str | None:
         """该用户当前有效租约的 gid；顺带清过期租约。线程安全，自持锁。"""
         with self._lock, self._job_lock(job_id):
@@ -283,7 +291,7 @@ class JobManager:
         with self._lock, self._job_lock(job_id):
             job = self.get(job_id)
             if job.state != "open":
-                return {"gid": None, "resume": False, "reason": "作业未开放"}
+                return {"gid": None, "resume": False, "reason": "作业未开放或已删除"}
             now = time.time()
             L = self._leases_of(job_id)
             # 自己已有有效租约 → resume
@@ -294,12 +302,24 @@ class JobManager:
             # 清过期
             for gid in [g for g, (u, dl) in L.items() if dl <= now]:
                 L.pop(gid, None)
-            for g in job._pool:            # 打乱后的派发顺序
+            q = self._skip_list(job_id, user)     # 本人近期跳过项
+            # 第 1 轮（避让）：不打乱后的派发顺序下发，但避开本人近期跳过的道集，
+            # 防止“跳过”在两个道集间来回振荡、永远走不到后面的任务。
+            for g in job._pool:
                 gid = g.gather_id
-                if job.store.is_labeled(gid):
+                if job.store.is_labeled(gid) or gid in L:
                     continue
-                if gid in L:
+                if gid in q:
                     continue
+                L[gid] = [user, now + self.ttl]
+                return {"gid": gid, "resume": False, "reason": None}
+            # 第 2 轮（回退）：其余要么已标、被占、要么皆为本用户近期跳过 → 允许回到近期跳过项
+            for g in job._pool:
+                gid = g.gather_id
+                if job.store.is_labeled(gid) or gid in L:
+                    continue
+                if gid in q:
+                    q.remove(gid)                # 消费：回到该张即解除避让
                 L[gid] = [user, now + self.ttl]
                 return {"gid": gid, "resume": False, "reason": None}
             return {"gid": None, "resume": False, "reason": "已全部标完或全部被占用"}
@@ -320,6 +340,28 @@ class JobManager:
                 L.pop(gid, None); dropped = True
             return dropped
 
+    def skip(self, job_id: str, user: str) -> dict:
+        """「跳过」：把 user 当前持有的道集放回池（不写任何记录），
+        并把该道集记入**本用户的近期跳过队列**，随后照常领取下一张——
+        claim 对本用户会优先避开这些近期跳过项，直到没有其它任务才回到它们，
+        避免“跳过”在两个道集之间来回振荡。
+
+        返回与 claim 同构：{"gid", "resume", "reason"} + "skipped"。
+        """
+        with self._lock, self._job_lock(job_id):
+            L = self._leases_of(job_id)
+            old = None
+            for gid in [g for g, (u, _) in L.items() if u == user]:
+                L.pop(gid, None)
+                old = old or gid                       # 通常只有一个，取第一个
+            if old:
+                q = self._skip_list(job_id, user)
+                if old not in q:
+                    q.append(old)
+            res = self.claim(job_id, user)
+            res["skipped"] = old
+            return res
+
     # ---- 查询 ----
     def _info(self, job: Job) -> dict:
         with self._job_lock(job.job_id):
@@ -333,7 +375,23 @@ class JobManager:
 
     def list_jobs(self) -> list[dict]:
         with self._lock:
-            return [self._info(self._jobs[j]) for j in self._order]
+            return [self._info(self._jobs[j]) for j in self._order
+                    if self._jobs[j].state != "deleted"]
+
+    def deleted_jobs(self) -> list[dict]:
+        """已软删除的作业（供管理区「恢复」）。本地文件仍保留。"""
+        with self._lock:
+            return [self._info(self._jobs[j]) for j in self._order
+                    if self._jobs[j].state == "deleted"]
+
+    def delete_job(self, job_id: str):
+        """软删除：作业标记为 deleted，从 list_jobs/下拉/进度中隐藏；
+        本地 jobs/<id> 结果文件一律不删除，可经 restore_job 恢复。"""
+        self.set_state(job_id, "deleted")
+
+    def restore_job(self, job_id: str):
+        """把已软删除的作业恢复为 open（回到列表/进度，可继续领取标注）。"""
+        self.set_state(job_id, "open")
 
     def progress(self, job_id: str):
         with self._lock, self._job_lock(job_id):

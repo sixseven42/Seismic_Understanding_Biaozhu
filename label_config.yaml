@@ -42,7 +42,7 @@ features:
   - name: 面波
     key: surface_wave
     bbox: true
-    bbox_color: "#ff0000"
+    bbox_color: "#1f6feb"          # 蓝实线
     options:
       - label: 存在
       - label: 不存在
@@ -65,7 +65,7 @@ features:
   - name: 近炮点强能量噪声
     key: near_shot_noise
     bbox: true
-    bbox_color: "#ffff00"
+    bbox_color: "#b58900"          # 深黄实线
     options:
       - label: 存在
       - label: 不存在

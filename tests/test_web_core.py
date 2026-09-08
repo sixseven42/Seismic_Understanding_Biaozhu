@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 import unittest
 
-from web_core import IMG_W, IMG_H, fmt_option, label_of, pixel_box_to_data
+from web_core import (IMG_W, IMG_H, fmt_option, jobs_progress_html, label_of,
+                      pixel_box_to_data)
 
 
 class _Opt:
@@ -38,6 +39,39 @@ class TestPixelBox(unittest.TestCase):
     def test_pixel_box_clamps_negative(self):
         box = pixel_box_to_data((-5, -5), (50, 50), 512, 1024)
         self.assertEqual(box["xyxy"], [0, 0, 50, 50])
+
+
+class TestJobsProgressHtml(unittest.TestCase):
+    def _jobs(self):
+        return [
+            {"job_id": "j1", "title": "A 作业", "state": "open",
+             "labeled": 3, "total": 10, "created_by": "boss"},
+            {"job_id": "j2", "title": "<inject>", "state": "closed",
+             "labeled": 5, "total": 5, "created_by": "boss"},
+        ]
+
+    def test_shows_counts_and_percent(self):
+        html = jobs_progress_html(self._jobs())
+        self.assertIn("3 / 10", html)
+        self.assertIn("30%", html)
+        self.assertIn("j1", html)
+
+    def test_full_progress_shows_100(self):
+        html = jobs_progress_html(self._jobs())
+        self.assertIn("5 / 5", html)
+        self.assertIn("100%", html)
+
+    def test_zero_total_does_not_crash(self):
+        jobs = [{"job_id": "j3", "title": "空", "state": "broken",
+                 "labeled": 0, "total": 0, "created_by": "boss"}]
+        html = jobs_progress_html(jobs)
+        self.assertIn("0 / 0", html)      # 防除零，仍能渲染
+        self.assertNotIn("NaN", html)
+
+    def test_escapes_title(self):
+        html = jobs_progress_html(self._jobs())
+        self.assertNotIn("<inject>", html)
+        self.assertIn("&lt;inject&gt;", html)
 
 
 if __name__ == "__main__":
