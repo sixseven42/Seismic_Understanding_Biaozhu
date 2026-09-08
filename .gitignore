@@ -4,3 +4,13 @@ output/
 test_output/
 __pycache__/
 *.pyc
+
+# 运行时/本地与敏感文件（不入库，公开仓库尤须排除）
+.gradio/
+.claude/
+.superpowers/
+jobs/
+cos_config.yaml
+users.yaml
+*.log
+nul

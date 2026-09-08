@@ -100,3 +100,4 @@ seismic_biaozhu/
 | v1.9 | 标签体系删除「线性噪声」「多次波」（10→8 特征）；migrate_remove_features.py 同步清理 948 条旧记录 |
 | v2.0 | 面波/近炮点强能量噪声新增矩形框选标注（Web 版）：JSONL 加 regions 字段，强制画框校验，导出图保持干净 |
 | v2.1 | 继承改为回找最近已标注道集（不继承框）；剔除功能曾加入后按用户决定移除；清空 output/ 旧标注（948 条）重标 |
+| v3.0 | 多人协作中央服务：jobmanager 作业/任务池/租约、users 账号/角色、cloudsync(COS)、web_app 去全局单例改多人（2026-09-08；spec/plan 见 docs/superpowers） |

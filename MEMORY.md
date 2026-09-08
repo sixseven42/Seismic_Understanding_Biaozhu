@@ -4,6 +4,57 @@
 
 ---
 
+## v3.1（2026-09-08）— 三类修复：图/标注对齐、标注页整图显示、乱序派发
+
+**背景**：基线为 v3 多用户中央服务（见下节补记）。本次全部针对 Web 标注实际使用问题。
+
+**1）导出图与显示图解耦（images/ ↔ labels.jsonl 一一对应）**
+- 起因：UI「显示 / 领取 / 保存后自动领下一张」都会走 `Job.ensure_image`，把**尚未标注**的下一条道集直接渲染进导出目录 `images/<gid>.png` → 出现「标一张却多一张下一道集的图」「有图无记录、有记录缺图」（真实作业里出现过无任何 jsonl 记录的孤立图 `...1399.png`；8 条记录只有 2 张图）。
+- 改法：`jobmanager.Job` 新增 `display_image()`：界面显示图只写 `jobs/<id>/.cache/`（不入导出目录；渲染 temp+os.replace 原子写）；`web_app.render_display()` 改走 `display_image`；`ensure_image()` 改为**仅由 `JM.save` 调用**生成导出图。→ 保存一张只出一张本道集导出图，`images/` 恒等于 `labels.jsonl`。
+- 配套：已把该作业 7 张缺失导出图从 npy 用同 clip 管线补齐（逐字节一致）、删除孤立 `1399.png`；现 8 记录 = 8 图。
+- 测试：`tests/test_jobmanager.py::TestImageExportOnlyOnSave`（显示不写导出图 / 保存只出自己 / 显示图在 .cache）。
+
+**2）标注页整图显示（修 CSS，不用再点「全局/全屏」）**
+- 起因：Gradio Image 外壳 `.block` 被内联 `height:640px; overflow:hidden` 锁死；512×1024 竖长图按标注列宽等比显示后高度远超 640，**下半截被裁**（窗口越宽裁得越多），只能点工具栏全屏看全图。
+- 改法：`web_app.ANNO_CSS` 改为 `#anno_imgcol > .block{height:100%!important; min-height:0; overflow:hidden}`（压过内联 640px）、`.image-container / .image-frame{height:100%}`、`img{width/height:auto; max-width/height:100%; object-fit:contain; flex 居中}` → 图片区高度 = 标注行高度，**整张始终完整可见**；`<img>` 元素框恰等于所绘图区域（无内层 letterbox），**图上点框的像素坐标映射不受影响**。已用无头 Chrome + DOM 几何实测：宽窗 1680 下图 512×1024 完整显示、底边贴合。
+
+**3）任务派发打乱（缓解标注疲劳）**
+- 起因：`claim()` 遍历原始（按数据值升序）`_gathers`，任一标注者长期拿到连续递增的数据段。
+- 改法：`Job.__init__` 用 `random.shuffle` 生成派发池 `self._pool`（每次进程内注册/加载随机一次）；`claim()` 只从 `job._pool` 取下一个未标注且未被占用的道集。resume/租约/进度/归还语义不变。
+- 测试：`TestClaimShuffledPool`：12 道集由单用户领完 = 全集排列且不再升序。
+
+**注意**：以上改动需**重启 web 服务**生效；全量单测 31 项通过。
+
+---
+
+## v3（当前功能基线，补记）— Web 版重构为多用户中央服务
+
+> 注：MEMORY 自 v2.1 起未记录 v3 大规模重构，现按代码/README 补一份基线，供后续迭代参照。
+
+**架构**：单 Gradio（6.26）进程 `python web_app.py`（默认 0.0.0.0:7860，可用 `启动.bat`），同局域网多人并发标注；**原始 sgy 只留服务机**。核心模块：`web_app.py`（UI+handler）、`web_core.py`（选项/像素↔数据换算纯逻辑）、`jobmanager.py`（作业池/租约/保存协调）、`users.py`+`users.yaml`（账号/角色）、`cloudsync.py`+`cos_config.yaml`（可选 COS 回传）、底层 `segy_reader / gather / preprocess / imaging / labels / storage`。
+
+**账号/角色**：users.yaml 登录时热读（改文件即生效，无需重启，已登录会话不受影响）。默认 `boss/boss123`=admin（建作业、打开/关闭作业、全部重传）、`ann1/ann123`=annotator（只能领标、查看/重开**自己**标过的记录）。Windows 防火墙需放行 7860；**勿多开实例指向同一 jobs/**。
+
+**作业与标注流程**：
+- admin「①建作业」：sgy 绝对路径 + 排序键/抽道集键（1-based 字节区间）+ 勾选键值 + clip 分位数（默认 99）→ 服务端抽一次道集 → `jobs/<标题>_<时间戳>/job.json`（含 values/clip/output_dir 等元数据）。
+- 标注者「②作业与标注」：选作业 →「领取下一张」即加**租约（TTL 30 分钟，交互自动续期）**，每张同一时刻仅一人持有；「保存并释放」= 写导出图+npy+upsert labels.jsonl、释放租约并**自动领取下一张**；挂机超时自动回池；「归还此张」放弃不落记录；「⧉ 继承最近已标注」回填类别（框不继承）。
+- admin「③管理」：全部重传（推 COS）、打开/关闭作业。
+
+**落点与契约**（`jobs/<job_id>/`）：
+- `labels.jsonl`：每行一条记录（gather_id/gather_key/value、n_traces、labels 8 特征→label、sentence、regions、image_path、npy_path、sort_keys、extract_key、source_file、annotated_by、timestamp），原子全量重写；
+- `images/<gid>.png`：**512×1024 纯数据图，仅在保存时生成**（v3.1 起），`images/` 应恒等于 labels；
+- `npy/<gid>.npy`：原始 float32 (道数,采样数)，**只留本地不上云**；
+- `.cache/<gid>.png`：界面显示缓存，非结果、不上传；
+- `regions`：`{feature_key: {xyxy:[512×1024 图像像素,含端点], traces/samples:[原始数据半开区间]} 或 null}`；显示图与导出图同 clip 管线、内容一致（实测逐字节相同）。bbox 特征：面波、近炮点强能量噪声（标签非「不存在」必须画框）。
+
+**云回传（可选）**：`cos_config.yaml` 置 `enabled:true` 并填密钥后**重启**生效；需 `pip install cos-python-sdk-v5`；对象键 `seismic/<job>/images/<gid>.png`、`seismic/<job>/labels.jsonl`；失败有界重试并写 `upload.log`，可用「全部重传」；未启用自动本地降级。
+
+**测试**：`tests/` 用合成 sgy（`segy_factory.write_sgy`）驱动 unittest；`python -m unittest discover -s tests`，当前 31 项全绿。
+
+**关键运行信息**：中文字体 `fonts/NotoSansCJKsc-Regular.otf` 勿删（出图中文）；导入 matplotlib 前 `MPLCONFIGDIR` 指到可写临时目录（imaging/web_app 已处理）；道头字节号按 1-based；SEG-Y 端序自动检测。
+
+---
+
 ## v2.1 — 继承改为「最近已标注」+ 清空旧标注重标
 
 **需求**（用户）：

@@ -78,7 +78,14 @@ class SegyReader:
         if self.format_code not in FORMAT_MAP:
             raise SegyReadError(f"不支持的采样格式码: {self.format_code}")
         self._np_type, self.sample_bytes, self._is_ibm = FORMAT_MAP[self.format_code]
-        self._dtype = np.dtype(e + self._np_type) if self.sample_bytes > 1 else np.dtype("i1")
+        # IBM 浮点 (ibm4) 无对应 numpy dtype：data 走 uint32 视图 + _ibm_to_ieee 转换，
+        # 因此这里只给非 IBM 格式构造 dtype。
+        if self._is_ibm:
+            self._dtype = np.dtype(e + "u4")
+        elif self.sample_bytes > 1:
+            self._dtype = np.dtype(e + self._np_type)
+        else:
+            self._dtype = np.dtype("i1")
 
         self.trace_bytes = HEADER_SIZE + self.ns * self.sample_bytes
         body = self.file_size - FILE_HEADER_SIZE
