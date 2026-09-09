@@ -11,11 +11,15 @@ from datetime import datetime
 import numpy as np
 
 from gather import Gather, extract_gathers, key_str, ranges_label
-from preprocess import apply_pipeline
+from preprocess import apply_pipeline, sample_clip_values
 from storage import LabelStore
 from imaging import render_data_only
 
 TTL_SECONDS = 30 * 60
+
+# 每次保存标注固定增强张数：同一道集随机采 N_AUG 个不同 clip 值各渲一张导出图。
+# （用户拍板 v3.6：不再建作业定单个 clip 作为导出，保存即存多张随机 clip 图。）
+N_AUG = 5
 
 class JobError(Exception):
     pass
@@ -36,7 +40,11 @@ class Job:
         self.title = meta.get("title", "")
         self.output_dir = meta["output_dir"]
         self.state = meta.get("state", "open")
+        # clip 语义 v3.6 起 = 仅「界面预览/画框参照」用（导出改为保存时 N_AUG 个随机 clip）
         self.clip = float(meta.get("clip_percentile", 99.0))
+        # 增强 clip 采样上下限：旧作业（job.json 无 aug_lo/aug_hi）缺失时 aug_ok=False，
+        # 视为「需重建」——不能保存、load_all 会将其标 broken。
+        self.aug_lo, self.aug_hi = self._read_aug(meta)
         self.ns = int(ns)
         self._gathers = gathers
         self._by_id = {g.gather_id: g for g in gathers}
@@ -47,6 +55,19 @@ class Job:
         self._pool = list(self._gathers)
         random.Random().shuffle(self._pool)
         self.store = LabelStore(os.path.join(self.output_dir, "labels.jsonl"))
+
+    @staticmethod
+    def _read_aug(meta: dict) -> tuple[float | None, float | None]:
+        """读增强 clip 上下限；缺失/非法即返回 (None, None)（视为旧版作业）。"""
+        try:
+            lo, hi = float(meta["aug_lo"]), float(meta["aug_hi"])
+        except (KeyError, TypeError, ValueError):
+            return None, None
+        return (lo, hi) if (0 < lo <= hi <= 100) else (None, None)
+
+    @property
+    def aug_ok(self) -> bool:
+        return self.aug_lo is not None and self.aug_hi is not None
 
     # ---- 池 / 元数据 ----
     def gather_ids(self) -> list[str]:
@@ -71,8 +92,10 @@ class Job:
         return apply_pipeline(self.raw(gid),
                               [{"name": "clip_percentile", "params": {"percentile": self.clip}}])
 
-    def image_rel(self, gid: str) -> str:
-        return f"images/{gid}.png"
+    @staticmethod
+    def aug_image_rel(gather_id: str, clip_value: float) -> str:
+        """增强导出图相对路径 images/<gather_id>__clip<值>.png。"""
+        return f"images/{gather_id}__clip{clip_value:g}.png"
 
     def npy_rel(self, gid: str) -> str:
         return f"npy/{gid}.npy"
@@ -85,22 +108,11 @@ class Job:
     def display_image(self, gid: str) -> str:
         """返回界面显示图绝对路径（.cache/<gid>.png，缺则渲染）。
 
-        显示图只用做标注/预览，绝不写入导出 images/；导出图只在保存时由
-        ensure_image() 生成，从而保证 images/ 与 labels.jsonl 一一对应。
+        显示图只用做标注/预览（预览 clip=self.clip），绝不写入导出 images/；
+        导出图只在保存时生成 N_AUG 张 <gid>__clip<值>.png，从而保证 images/
+        与 labels.jsonl 记录一一对应、无孤立图。
         """
         abs_p = os.path.join(self.cache_dir, f"{gid}.png")
-        if not os.path.isfile(abs_p):
-            self._render_png(self.display(gid), abs_p)
-        return abs_p
-
-    def ensure_image(self, gid: str) -> str:
-        """导出图 images/<gid>.png（缺则渲染）。
-
-        仅应在保存标注（JobManager.save）时调用：保存即把该道集固化为结果图。
-        任何「只看不保存」的显示路径不得调用本方法，否则会在 images/ 产生
-        无标注记录对应的孤立图（显示请用 display_image）。
-        """
-        abs_p = os.path.join(self.output_dir, self.image_rel(gid))
         if not os.path.isfile(abs_p):
             self._render_png(self.display(gid), abs_p)
         return abs_p
@@ -208,22 +220,35 @@ class JobManager:
         return [g for g in gs if g.n_traces >= limit]
 
     def _job_meta(self, job_id: str, title: str, path: str, endian: str,
-                  sort_keys, extract_keys, values, clip: float, created_by: str,
+                  sort_keys, extract_keys, values, clip: float,
+                  aug_lo: float, aug_hi: float, created_by: str,
                   output_dir: str, min_traces: int = 0) -> dict:
         return {"job_id": job_id, "title": title, "source_file": os.path.abspath(path),
                 "endian": endian, "sort_keys": [list(k) for k in sort_keys],
                 "extract_keys": [list(k) for k in extract_keys],
-                "values": _json_values(values), "clip_percentile": float(clip),
+                "values": _json_values(values),
+                # clip_percentile = 预览 clip（仅界面显示）；导出用 aug_lo~aug_hi 随机 N_AUG 张
+                "clip_percentile": float(clip),
+                "aug_lo": float(aug_lo), "aug_hi": float(aug_hi),
                 "min_traces": int(min_traces or 0),
                 "created_by": created_by,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "state": "open", "output_dir": output_dir}
 
     def create_job(self, source_file: str, sort_keys, extract_keys, values,
-                   clip: float, title: str, created_by: str,
-                   endian: str = "auto", min_traces: int = 0) -> Job:
-        """从真实 sgy 抽道集建作业：写 job.json + 注册。values: 单字段 list[int] / 多字段 list[tuple]。
-        min_traces: 道数 < 该值的道集从任务池滤去（不标注）；0=不过滤。"""
+                   clip: float | None = None, title: str = "", created_by: str = "",
+                   endian: str = "auto", min_traces: int = 0,
+                   aug_lo: float = 90.0, aug_hi: float = 99.9) -> Job:
+        """从真实 sgy 抽道集建作业：写 job.json + 注册。
+
+        values: 单字段 list[int] / 多字段 list[tuple]。
+        clip: 预览 clip（仅界面显示/画框参照，默认 99）。
+        aug_lo/aug_hi: 保存时随机采样的 clip 范围（每张道集存 N_AUG 张）。
+        min_traces: 道数 < 该值的道集从任务池滤去（不标注）；0=不过滤。
+        """
+        clip = 99.0 if clip is None else clip
+        if not (0 < aug_lo <= aug_hi <= 100):
+            raise JobError("增强 clip 上下限须满足 0 < 下限 ≤ 上限 ≤ 100")
         r, gs = self._extract(source_file, sort_keys, extract_keys, values, endian)
         gs = self._filter_min_traces(gs, min_traces)
         if not gs:
@@ -234,7 +259,8 @@ class JobManager:
         output_dir = os.path.join(self.jobs_root, job_id)
         os.makedirs(output_dir, exist_ok=True)
         meta = self._job_meta(job_id, title, source_file, endian,
-                              sort_keys, extract_keys, values, clip, created_by, output_dir,
+                              sort_keys, extract_keys, values, clip,
+                              aug_lo, aug_hi, created_by, output_dir,
                               min_traces=min_traces)
         with open(os.path.join(output_dir, "job.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -243,7 +269,12 @@ class JobManager:
         return job
 
     def load_all(self) -> list[Job]:
-        """启动恢复：扫 jobs_root 下含 job.json 的目录，重抽道集重新注册；抽不出标 broken。"""
+        """启动恢复：扫 jobs_root 下含 job.json 的目录，重抽道集重新注册。
+
+        旧版作业（job.json 无 aug_lo/aug_hi，v3.5 及以前建的）一律标 broken——
+        用户已拍板「不兼容，一律重建」，避免按单个固定 clip 的旧格式继续标注。
+        抽不出数据同样标 broken。
+        """
         if not os.path.isdir(self.jobs_root):
             os.makedirs(self.jobs_root, exist_ok=True)
         loaded = []
@@ -256,6 +287,11 @@ class JobManager:
                 with open(jf, encoding="utf-8") as f:
                     meta = json.load(f)
             except Exception:
+                continue
+            if "aug_lo" not in meta or "aug_hi" not in meta:
+                meta = dict(meta); meta["state"] = "broken"
+                job = self.register_job(meta, [], 0, lambda g: np.zeros((0, 0), np.float32))
+                loaded.append(job)
                 continue
             try:
                 r, gs = self._extract(
@@ -421,30 +457,46 @@ class JobManager:
             return self.get(job_id).store.get(gid)
 
     def mine(self, job_id: str, user: str) -> list[dict]:
-        """该用户标过的记录，按写入顺序。"""
+        """该用户标过的记录（只含基础记录，不含增强副本，按写入顺序）。
+
+        增强记录的 gather_id 带 __clip 后缀、不对应真实道集，供"我标注的"重开
+        编辑会指向不存在的道集，故一律排除。
+        """
         with self._lock, self._job_lock(job_id):
             job = self.get(job_id)
             return [job.store.records[g] for g in job.store.order
-                    if job.store.records[g].get("annotated_by") == user]
+                    if job.store.records[g].get("annotated_by") == user
+                    and "augmented_from" not in job.store.records[g]]
 
     # ---- 保存 ----
     def save(self, job_id: str, user: str, gather_id: str,
              selection: dict, boxes: dict, is_admin: bool = False,
              save_npy: bool = True):
-        """返回 (ok, record, err)。成功即渲染缓存图+npy 并写 store、释放租约。"""
+        """保存标注：每张道集写 1 条基础记录(image_path=null) + N_AUG 条增强记录。
+
+        增强记录 = 从原始数据按 aug_lo~aug_hi 随机采 N_AUG 个不同 clip 值各渲一张
+        images/<gather_id>__clip<值>.png（labels/sentence/regions 与基础一致）。
+        重开/重复保存先删旧增强记录与其图片再写，避免堆积。
+
+        返回 (ok, base_record, aug_records, err)；失败时 base/aug 均为 None/[]。
+        """
         with self._lock, self._job_lock(job_id):
             job = self.get(job_id)
             try:
                 g = job.gather(gather_id)
             except JobError as e:
-                return False, None, str(e)
+                return False, None, [], str(e)
+
+            if not job.aug_ok:
+                return False, None, [], ("旧版作业未配置增强 clip 上下限（aug_lo/aug_hi），"
+                                         "请用新版重新创建作业后再标注")
 
             errs = self.cfg.validate_selection(selection)
             if errs:
-                return False, None, "尚有未选特征：" + "、".join(errs)
+                return False, None, [], "尚有未选特征：" + "、".join(errs)
             regions, box_errs = finalize_regions(self.cfg, selection, boxes)
             if box_errs:
-                return False, None, "；".join(box_errs)
+                return False, None, [], "；".join(box_errs)
 
             prev = job.store.get(gather_id)
             holding = self.current(job_id, user) == gather_id
@@ -455,20 +507,34 @@ class JobManager:
                 for gid, (u, dl) in self._leases_of(job_id).items():
                     if gid == gather_id and dl > time.time():
                         holder = u
-                return False, None, f"该道集已被 {holder} 持有或标注，不能保存"
+                return False, None, [], f"该道集已被 {holder} 持有或标注，不能保存"
 
-            # 渲染缓存导出图（已存在则复用）
-            abs_img = job.ensure_image(gather_id)
-            rel_img = job.image_rel(gather_id)
+            try:
+                clips = sample_clip_values(job.aug_lo, job.aug_hi, N_AUG)
+            except ValueError as e:
+                return False, None, [], f"增强 clip 范围过窄无法采 {N_AUG} 个值：{e}"
+
+            # 清旧增强（重开/重复保存不堆积）：删旧增强记录 + 对应旧图
+            img_dir = os.path.join(job.output_dir, "images")
+            for old_id in job.store.remove_augmented(gather_id):
+                p = os.path.join(img_dir, f"{old_id}.png")
+                if os.path.isfile(p):
+                    os.remove(p)
+
+            raw = job.raw(gather_id)
             rel_npy = None
             if save_npy:
                 abs_npy = os.path.join(job.output_dir, job.npy_rel(gather_id))
                 os.makedirs(os.path.dirname(abs_npy), exist_ok=True)
-                np.save(abs_npy, job.raw(gather_id))
+                np.save(abs_npy, raw)
                 rel_npy = job.npy_rel(gather_id)
 
             meta = job.meta
-            record = {
+            # 重开修改/他人覆盖时保留原标注者（spec §5.4）；仅新记录用当前 user
+            annotator = user
+            if prev is not None and prev.get("annotated_by"):
+                annotator = prev["annotated_by"]
+            base = {
                 "gather_id": gather_id,
                 "gather_key": g.key,
                 "gather_value": list(g.value) if isinstance(g.value, tuple) else int(g.value),
@@ -476,19 +542,28 @@ class JobManager:
                 "labels": self.cfg.to_record_labels(selection),
                 "sentence": self.cfg.render_sentence(selection),
                 "regions": regions,
-                "image_path": rel_img,
                 "npy_path": rel_npy,
                 "sort_keys": ", ".join(key_str(tuple(k)) for k in meta["sort_keys"]),
                 "extract_key": ranges_label([tuple(k) for k in meta["extract_keys"]]),
                 "source_file": meta["source_file"],
-                "annotated_by": user,
+                "annotated_by": annotator,
             }
-            # 重开修改/他人覆盖时保留原标注者（spec §5.4）；仅新记录用当前 user
-            if prev is not None and prev.get("annotated_by"):
-                record["annotated_by"] = prev["annotated_by"]
-            rec = job.store.upsert(record)
+            aug_records = []
+            for cp in clips:
+                d = apply_pipeline(raw, [{"name": "clip_percentile",
+                                          "params": {"percentile": float(cp)}}])
+                aug_id = f"{gather_id}__clip{cp:g}"
+                rel_img = Job.aug_image_rel(gather_id, cp)
+                job._render_png(d, os.path.join(job.output_dir, rel_img))
+                aug_rec = dict(base)
+                aug_rec.update({"gather_id": aug_id, "image_path": rel_img,
+                                "augmented_from": gather_id, "clip_percentile": float(cp)})
+                aug_records.append(job.store.upsert(aug_rec))
+            # 基础记录：仅用于断点续标/进度/重开，无导出图
+            base["image_path"] = None
+            rec = job.store.upsert(base)
             # 释放本次租约（回改场景无租约，幂等）
             L = self._leases_of(job_id)
             if L.get(gather_id) and L[gather_id][0] == user:
                 L.pop(gather_id, None)
-            return True, rec, None
+            return True, rec, aug_records, None

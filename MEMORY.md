@@ -4,6 +4,75 @@
 
 ---
 
+## v3.6.2（2026-09-09）— 修复框编辑器两个前端 bug
+
+**用户实测（v3.6.1 后）**：
+1. 首次点「▣框选」拖不出框，必须点一次「✕清除」再点「▣框选」才能画；
+2. 框四角手柄能显示但拖不动，鼠标放框上也无移动效果。
+
+**根因**：
+- (1) 指针监听绑在 canvas 上、pointer-events 依赖 `place()` 把它置 auto，受首帧/重渲染时序影响未生效；且用共享 `bound` 只绑一次，Gradio 重建 canvas 节点后新画布无监听。
+- (2) `hitTest` 用页面坐标 `clientX/Y` 去比对 `screenRect` 算出的**画布局部坐标**（0~显示宽高），两者量纲不一致 → 永远识别不到「点在框内/点在角上」，移动/缩放无从触发。
+
+**修复**（ANNO_JS 重写）：
+- 指针事件改绑在 `<img>` 本身上（按元素 `__annoBound` 绑定；img 始终接收事件，不依赖画布时序），canvas 改为 `pointer-events:none` 仅作绘制层；
+- 命中/绘制/换算统一按**当前 img 的 getBoundingClientRect 局部坐标**（`imgRect`/`localPt`/`localToNat`），命中与绘制同系；
+- 保留 `setInterval(…,900)` 周期校正画布位置与事件绑定，resize/scroll/MutationObserver/img load 均触发重定位。
+
+**验证**：48 项单测通过、`py_compile`、`node --check` 通过。**仍需浏览器实测**：首次▣框选即画、画后可整框拖/拖角缩放、清除后重画、保存不再报未画框。
+
+---
+
+## v3.6.1（2026-09-09）— 修复「重画框后保存仍报未画框」+ 画框支持拖动/缩放
+
+**Bug**（用户）：面波选「存在」并画框 → 点清除 → 再画框 → 保存并释放，仍报
+「面波」为「存在」但未画框。
+
+**根因（前端）**：画框落库靠鼠标松开时 `fetch('/api/anno_box')`，其前置 `currentUser()`
+用正则从账号栏取用户名，期望文本里还带着反引号；但 Gradio Markdown 会把 `` `boss` ``
+**渲染成 `<code>boss</code>`**，`textContent` 里已无反引号 → 恒返回 `null` →
+fetch 被 `if(user)` 拦下从未发出 → 框只画在浏览器 overlay、服务器从未收到 →
+保存校验自然读不到框。（服务端 clear→重画→保存状态机已用真函数模拟验证正确。）
+
+**修复**：`currentUser()` 优先读 `#who_md code` 文本，兜底从渲染文本
+「当前用户：boss（admin）」切出用户名（不再依赖反引号）。
+
+**特性（用户要求）**：画框不再一次定型——支持**拖动位置 + 拖四角缩放**。
+- 前端 `ANNO_JS` 重写为小型框编辑器：从服务器 `GET /api/boxes` 回填本道集已有框
+  （重开已保存记录也可继续编辑）；点「▣框选」拖新框/重画；已有框可整框拖动、
+  拖四角手柄缩放（对角锚定，MIN=4 自然像素），松开即 POST 到 `/api/anno_box`；
+  「✕清除」删除本地框并由原 clear_box 清服务端。坐标仍为自然像素 512×1024，
+  与保存时像素↔道/采样换算一致；导出图保持干净。
+- 服务端新增只读 `GET /api/boxes?user=`（`_boxes_payload`：读 `st['boxes']`，
+  重开时回退记录 regions），仅返回含真实框的特征。
+- 回归：48 项单测通过；JS 用 node --check 通过；服务端 draw/clear/redraw 生命周期
+  用真函数模拟验证。
+
+**注意**：重启 `python web_app.py` 生效；请在浏览器实测：画框→拖动→拖角缩放→
+清除→重画→保存，应能正常保存且导出图无框。
+
+---
+
+## v3.6（2026-09-09）— 保存即存多张随机 clip 增强图（不再固定单 clip 导出）+ 道数下限默认 20
+
+**需求**（用户）：每次标注保存不要只存「作业固定 clip」的一张导出图——不同 clip 显示差异大、单值有偏置；改回更早版本（v1.7/v1.8）的多 clip 随机采样，保存一张道集即产多张不同 clip 的图。另：道数下限默认 0 → 20。曾查证 GitHub/历史：v1.7 保存内联增强、v1.8 离线 backfill 均为「5 张随机 clip 图」模式；v3 为保 images↔labels 1:1 刻意删除了内联增强、挪到离线 `backfill_augment.py`。
+
+**用户拍板的决策**：
+- 每张道集固定存 **5 张**（N_AUG=5），不再建作业填张数；
+- 随机 clip 范围由 admin **建作业时填下限/上限**（默认 90 / 99.9，0.1 步长无放回采样，5 个值互不相同）；
+- 作业仍记一个 **预览 clip**（默认 99）：**仅**界面显示/画框参照用，不再作为导出 clip；
+- 旧作业（job.json 无 aug_lo/aug_hi）**不兼容、一律重建**——load_all 时标 broken、claim/保存被拒，需删除后新建。
+
+**内容**：
+- `jobmanager.py`：`Job` 读 `aug_lo/aug_hi`（缺失→`aug_ok=False`，旧版拒绝保存）；`create_job/_job_meta` 写 `aug_lo/aug_hi`；`N_AUG=5`；`load_all` 缺 aug 字段 → 标 broken（不可领取）；`JobManager.save` 重写：返回 **(ok, 基础记录, 增强记录列表, err)**——先 `remove_augmented`+删旧 `images/<gid>__clip*.png`（重存不堆积），再按 `sample_clip_values(lo,hi,5)` 渲染 5 张 `images/<gid>__clip<值>.png`、各写一条 `augmented_from=gid / clip_percentile=值` 记录（labels/sentence/regions 与基础一致）；基础记录 `image_path=None`（无导出图），供断点/进度/重开；删除 `ensure_image/image_rel`（单张导出语义废弃），显示仍走 `.cache`；`mine()` 只返回基础记录（防重开增强 id 落到不存在道集）。
+- `web_app.py` ①建作业：单 clip 输入框 → 三输入（预览 clip 99 / 增强下限 90 / 增强上限 99.9），建时校验 `0<下限≤上限≤100` 且步长可采满 5 值；道数下限默认 20；`save_anno` 适配 4 元返回、云上传把 **5 张增强图** + labels.jsonl 入队、成功提示带张数。
+- labels.jsonl 行结构不变（基础行 `image_path:null`；增强行带 `augmented_from`+`clip_percentile`+`image_path`）。`backfill_augment.py`（离线，文件前缀定范围）与 v1.7 内联逻辑（main_window.py）保留供参考/兼容。
+- 测试：meta 夹具补 aug 字段、save 解包 4 元；新增 5 图/5 记录落盘、重存不堆积、旧作业拒绝保存、范围过窄报错、load_all 旧作业标 broken、`mine` 排除增强等；全量 **48 项通过**。
+
+**注意**：重启 web 服务生效。**存量 jobs/ 下旧版作业将被标为异常（broken），需删除后重建**才能标注；新作业每次保存产 5 张增强图 + 基础行。npy 仍只留本地、由增强图随时可重渲染。
+
+---
+
 ## v3.5（2026-09-08）— 建作业支持「道数下限」过滤
 
 **需求**（用户）：建作业时指定一个道数下限，道数少于该值的道集从作业池滤去、不标注。

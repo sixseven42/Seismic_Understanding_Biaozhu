@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-import os, sys, tempfile, time, unittest
+import json, os, sys, tempfile, time, unittest
 import numpy as np
 # 让本文件能导入同目录的 segy_factory（python -m unittest tests.test_jobmanager 时 tests/ 不在 sys.path）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -12,11 +12,15 @@ from jobmanager import open_job, JobManager, JobError, finalize_regions
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CFG = LabelConfig(os.path.join(ROOT, "label_config.yaml"))
 
-def meta_for(job_id, out):
-    return {"job_id": job_id, "title": "测试", "source_file": "x.sgy", "endian": "auto",
-            "sort_keys": [[95, 96]], "extract_keys": [[95, 96]], "values": [1, 2, 3],
-            "clip_percentile": 99.0, "created_by": "boss",
-            "created_at": "2026-01-01T00:00:00", "state": "open", "output_dir": out}
+def meta_for(job_id, out, aug=True):
+    """默认带新版增强字段（aug_lo/aug_hi）；aug=False 模拟旧版作业（需重建）。"""
+    m = {"job_id": job_id, "title": "测试", "source_file": "x.sgy", "endian": "auto",
+         "sort_keys": [[95, 96]], "extract_keys": [[95, 96]], "values": [1, 2, 3],
+         "clip_percentile": 99.0, "created_by": "boss",
+         "created_at": "2026-01-01T00:00:00", "state": "open", "output_dir": out}
+    if aug:
+        m.update({"aug_lo": 90.0, "aug_hi": 99.9})
+    return m
 
 def fake_gathers():
     gs = []
@@ -116,45 +120,106 @@ class TestSave(unittest.TestCase):
     def good_boxes(self):
         return {f.key: {"xyxy": [1,1,2,2], "traces": [0,2], "samples": [0,4]} for f in CFG.features if f.bbox}
 
+    def pngs_in_images(self):
+        d = os.path.join(self.out, "images")
+        if not os.path.isdir(d):
+            return []
+        return sorted(f for f in os.listdir(d) if f.endswith(".png"))
+
     def test_save_requires_valid_selection(self):
         claim = self.manager.claim("job1", "ann1")
-        ok, rec, err = self.manager.save("job1", "ann1", claim["gid"], {}, {}, is_admin=False)
-        self.assertFalse(ok); self.assertIn("未选择", err)
+        ok, rec, augs, err = self.manager.save("job1", "ann1", claim["gid"], {}, {},
+                                               is_admin=False)
+        self.assertFalse(ok); self.assertIsNone(rec); self.assertEqual(augs, [])
+        self.assertIn("未选择", err)
 
-    def test_save_success_sets_annotated_by_and_image(self):
+    def test_save_writes_five_aug_images_and_records(self):
         claim = self.manager.claim("job1", "ann1")
-        ok, rec, err = self.manager.save("job1", "ann1", claim["gid"],
-                                         self.full_selection(), self.good_boxes())
-        self.assertTrue(ok, err); self.assertEqual(rec["annotated_by"], "ann1")
-        img = os.path.join(self.out, rec["image_path"])
-        self.assertTrue(os.path.isfile(img))            # 渲染缓存已生成
+        gid = claim["gid"]
+        ok, rec, augs, err = self.manager.save("job1", "ann1", gid,
+                                               self.full_selection(), self.good_boxes())
+        self.assertTrue(ok, err)
+        # 基础记录：标注者归属、无导出图、保留 npy
+        self.assertEqual(rec["annotated_by"], "ann1")
+        self.assertEqual(rec["gather_id"], gid)
+        self.assertIsNone(rec["image_path"])
         self.assertTrue(os.path.isfile(os.path.join(self.out, rec["npy_path"])))
-        self.assertTrue(self.manager.progress("job1")[0] >= 1)
+        # 5 条增强记录 + 5 张图，clip 各不同、labels 与基础一致
+        self.assertEqual(len(augs), 5)
+        clips = []
+        for a in augs:
+            self.assertTrue(os.path.isfile(os.path.join(self.out, a["image_path"])))
+            self.assertEqual(a["augmented_from"], gid)
+            self.assertEqual(a["labels"], rec["labels"])
+            self.assertEqual(a["sentence"], rec["sentence"])
+            self.assertEqual(a["regions"], rec["regions"])
+            self.assertEqual(a["annotated_by"], "ann1")
+            clips.append(a["clip_percentile"])
+            self.assertTrue(a["image_path"].startswith("images/" + gid + "__clip"))
+        self.assertEqual(len(set(clips)), 5)               # 5 个 clip 互不相同
+        self.assertTrue(all(90.0 <= c <= 99.9 for c in clips))
+        self.assertEqual(len(self.pngs_in_images()), 5)    # 只多这 5 张导出图
+        self.assertTrue(self.manager.progress("job1")[0] >= 1)   # 进度只按基础计数
+        # 6 条记录 = 1 基础 + 5 增强
+        self.assertEqual(len(self.job.store.records), 6)
+
+    def test_resave_does_not_accumulate_aug(self):
+        claim = self.manager.claim("job1", "ann1")
+        gid = claim["gid"]
+        for _ in range(2):
+            ok, rec, augs, err = self.manager.save("job1", "ann1", gid,
+                                                   self.full_selection(), self.good_boxes())
+            self.assertTrue(ok, err)
+            self.assertEqual(len(augs), 5)
+        self.assertEqual(len(self.job.store.records), 6)     # 重存后仍 1 基础 + 5 增强
+        self.assertEqual(len(self.pngs_in_images()), 5)
+
+    def test_save_rejects_legacy_job_without_aug(self):
+        # 旧版作业（job.json 无 aug_lo/hi）：一律重建，禁止保存
+        out2 = os.path.join(self.root, "job_legacy"); os.makedirs(out2)
+        meta = meta_for("job_legacy", out2, aug=False)
+        self.manager.register_job(meta, fake_gathers(), 200, fake_provider())
+        c = self.manager.claim("job_legacy", "ann1")
+        ok, rec, augs, err = self.manager.save("job_legacy", "ann1", c["gid"],
+                                               self.full_selection(), self.good_boxes())
+        self.assertFalse(ok); self.assertIn("重新创建", err)
+
+    def test_save_narrow_clip_range_fails(self):
+        out3 = os.path.join(self.root, "job_narrow"); os.makedirs(out3)
+        meta = meta_for("job_narrow", out3)
+        meta.update({"aug_lo": 99.5, "aug_hi": 99.5})        # 只 1 个可选值，采不出 5 个
+        self.manager.register_job(meta, fake_gathers(), 200, fake_provider())
+        c = self.manager.claim("job_narrow", "ann1")
+        ok, rec, augs, err = self.manager.save("job_narrow", "ann1", c["gid"],
+                                               self.full_selection(), self.good_boxes())
+        self.assertFalse(ok); self.assertIn("过窄", err)
 
     def test_other_user_cannot_save_someone_elses_claimed(self):
         a = self.manager.claim("job1", "ann1")
-        ok, rec, err = self.manager.save("job1", "ann2", a["gid"],
-                                         self.full_selection(), self.good_boxes())
+        ok, rec, augs, err = self.manager.save("job1", "ann2", a["gid"],
+                                               self.full_selection(), self.good_boxes())
         self.assertFalse(ok); self.assertIn("已被", err)
 
     def test_owner_can_resave_and_admin_can_override(self):
         a = self.manager.claim("job1", "ann1")
         self.manager.save("job1", "ann1", a["gid"], self.full_selection(), self.good_boxes())
-        ok, rec, err = self.manager.save("job1", "ann1", a["gid"],
-                                         self.full_selection(), self.good_boxes())
+        ok, rec, augs, err = self.manager.save("job1", "ann1", a["gid"],
+                                               self.full_selection(), self.good_boxes())
         self.assertTrue(ok, err)                        # 本人回改
         self.assertEqual(rec["annotated_by"], "ann1")   # 回改保留原标注者
-        ok, rec, err = self.manager.save("job1", "boss", a["gid"],
-                                         self.full_selection(), self.good_boxes(), is_admin=True)
+        ok, rec, augs, err = self.manager.save("job1", "boss", a["gid"],
+                                               self.full_selection(), self.good_boxes(),
+                                               is_admin=True)
         self.assertTrue(ok, err)                        # admin 覆盖
         self.assertEqual(rec["annotated_by"], "ann1")   # 覆盖时仍保留原标注者（spec §5.4）
 
 class TestImageExportOnlyOnSave(unittest.TestCase):
-    """回归：显示/领取 不得向导出 images/ 目录写图；只有保存才生成导出图。
+    """回归：显示/领取 不得向导出 images/ 目录写图；只有保存才生成增强导出图。
 
-    bug: web_app.render_display(领取、保存后自动领下一张都会触发显示) 走 ensure_image，
-    把尚未标注的道集直接写成导出图 images/<gid>.png —— 造成「标一张却出现两张结果图」、
+    bug: web_app.render_display(领取、保存后自动领下一张都会触发显示) 走导出图，
+    把尚未标注的道集直接写成导出图 —— 造成「标一张却出现多张结果图」、
     images/ 出现无任何 jsonl 记录的孤立图、导出图与标注记录永远对不上。
+    v3.6 起保存导出 N_AUG=5 张 <gid>__clip<值>.png，显示仍只走 .cache。
     """
     def setUp(self):
         self.root = tempfile.mkdtemp()
@@ -181,20 +246,22 @@ class TestImageExportOnlyOnSave(unittest.TestCase):
         self.assertTrue(self.job.display_image(g1))      # 显示一张未标注道集
         self.assertEqual(self.pngs_in_images(), [])      # 不得生成导出图
 
-    def test_one_save_exports_only_its_own_image(self):
+    def test_save_exports_only_own_gather_aug_images(self):
         g1 = self.manager.claim("job1", "ann1")["gid"]
         self.job.display_image(g1)                       # 领取即显示
         sel, boxes = self.sel_boxes()
-        ok, rec, err = self.manager.save("job1", "ann1", g1, sel, boxes)
+        ok, rec, augs, err = self.manager.save("job1", "ann1", g1, sel, boxes)
         self.assertTrue(ok, err)
         # 保存后自动领取并显示下一张（save_anno 尾部行为）
         g2 = self.manager.claim("job1", "ann1")["gid"]
         self.job.display_image(g2)
         self.assertNotEqual(g1, g2)
-        self.assertEqual(self.pngs_in_images(),
-                         [os.path.basename(rec["image_path"])])   # 只有刚保存那张
+        self.assertEqual(len(self.pngs_in_images()), 5)                 # 刚保存那张的 5 张增强图
+        names = {os.path.basename(a["image_path"]) for a in augs}
+        self.assertTrue(names <= set(self.pngs_in_images()))           # 记录与图一一对应
+        self.assertFalse(any(not n.startswith(g1 + "__clip") for n in self.pngs_in_images()))
 
-    def test_display_and_export_render_same_content(self):
+    def test_display_image_lives_in_cache_not_export(self):
         g1 = self.manager.claim("job1", "ann1")["gid"]
         shown = self.job.display_image(g1)
         self.assertTrue(os.path.isfile(shown))
@@ -230,7 +297,7 @@ class TestSkip(unittest.TestCase):
                  for f in CFG.features if f.bbox}
         for _ in range(2):
             c = self.manager.claim("job1", "ann1")
-            ok, rec, err = self.manager.save("job1", "ann1", c["gid"], sel, boxes)
+            ok, rec, augs, err = self.manager.save("job1", "ann1", c["gid"], sel, boxes)
             self.assertTrue(ok, err)
         hold = self.manager.claim("job1", "ann2")      # 只剩最后一张，ann2 拿到
         self.assertEqual(self.manager.progress("job1"), (2, 3))
@@ -336,7 +403,7 @@ class TestClaimShuffledPool(unittest.TestCase):
             self.assertIsNotNone(c["gid"], "应能一直领取到剩余道集")
             v = int(c["gid"].rsplit("_", 1)[1])
             got.append(v)
-            ok, rec, err = self.manager.save("job1", "ann1", c["gid"], sel, boxes)
+            ok, rec, augs, err = self.manager.save("job1", "ann1", c["gid"], sel, boxes)
             self.assertTrue(ok, err)
         self.assertEqual(sorted(got), list(range(1, n + 1)))   # 每张恰好一次（全集排列）
         self.assertNotEqual(got, list(range(1, n + 1)))        # 不再按原始顺序连续下发
@@ -371,9 +438,24 @@ class TestCreateAndRestore(unittest.TestCase):
         sel = {f.name: ("不存在" if f.option_by_label("不存在") else f.options[0].label)
                for f in CFG.features}
         boxes = {f.key: {"xyxy": [0, 0, 3, 5], "traces": [0, 3], "samples": [0, 6]} for f in CFG.features if f.bbox}
-        ok, rec, err = m2.save(job.job_id, "ann1", claim["gid"], sel, boxes)
+        ok, rec, augs, err = m2.save(job.job_id, "ann1", claim["gid"], sel, boxes)
         self.assertTrue(ok, err)
-        self.assertTrue(os.path.isfile(os.path.join(job.output_dir, rec["image_path"])))
+        self.assertIsNone(rec["image_path"])                     # 基础记录无导出图
+        self.assertEqual(len(augs), 5)
+        for a in augs:
+            self.assertTrue(os.path.isfile(os.path.join(job.output_dir, a["image_path"])))
+        # 旧版作业（job.json 无 aug_lo/hi）在启动恢复时一律标 broken、不可领取
+        legacy_out = os.path.join(self.root, "jobs", "legacy__x"); os.makedirs(legacy_out)
+        legacy_meta = meta_for("legacy__x", legacy_out, aug=False)
+        legacy_meta.update({"source_file": self.sgy, "extract_keys": [[95, 96]],
+                            "values": [1, 2]})
+        with open(os.path.join(legacy_out, "job.json"), "w", encoding="utf-8") as f:
+            json.dump(legacy_meta, f, ensure_ascii=False)
+        m3 = JobManager(os.path.join(self.root, "jobs"), CFG)
+        m3.load_all()
+        info = next(j for j in m3.list_jobs() if j["job_id"] == "legacy__x")
+        self.assertEqual(info["state"], "broken")
+        self.assertIsNone(m3.claim("legacy__x", "ann1")["gid"])
 
 class TestCreateMinTraces(unittest.TestCase):
     """建作业时按「道数下限」滤去道数过少的道集。"""

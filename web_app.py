@@ -27,7 +27,7 @@ from fastapi.responses import JSONResponse
 from web_core import fmt_option, jobs_progress_html, label_of, pixel_box_to_data
 from labels import LabelConfig
 from users import Accounts
-from jobmanager import JobManager, JobError
+from jobmanager import JobManager, JobError, N_AUG
 from cloudsync import Uploader, load_config
 from gather import parse_ranges, gather_values, ranges_label
 from segy_reader import SegyReader, SegyReadError
@@ -274,8 +274,11 @@ def _parse_job_values(sort_text: str, gkey_text: str, selected: list[str]):
 
 
 def create_job_ui(request: gr.Request, path, endian_text, sort_text, gkey_text,
-                  selected, clip, title, min_traces):
-    """创建作业：抽一次道集（可按道数下限滤去过少者）、写 job.json、注册并刷新下拉。"""
+                  selected, clip, aug_lo, aug_hi, title, min_traces):
+    """创建作业：抽一次道集（可按道数下限滤去过少者）、写 job.json、注册并刷新下拉。
+
+    clip: 预览 clip（仅界面显示/画框参照）；aug_lo/aug_hi: 保存时随机采样的 clip 范围。
+    """
     user = _user(request)
     if not _is_admin(user):
         return "❌ 仅管理员可创建作业", gr.update(), gr.update()
@@ -295,9 +298,21 @@ def create_job_ui(request: gr.Request, path, endian_text, sort_text, gkey_text,
     except (TypeError, ValueError):
         min_traces = 0
     try:
+        clip = float(clip if clip is not None else 99.0)
+        aug_lo = float(aug_lo if aug_lo is not None else 90.0)
+        aug_hi = float(aug_hi if aug_hi is not None else 99.9)
+    except (TypeError, ValueError):
+        return "❌ clip 参数须为数字", gr.update(), gr.update()
+    if not (0 < aug_lo <= aug_hi <= 100):
+        return "❌ 增强 clip 上下限须满足 0 < 下限 ≤ 上限 ≤ 100", gr.update(), gr.update()
+    # 0.1 步长至少要有 N_AUG 个可选值，否则保存时采不出 N_AUG 个不同 clip
+    if int(round(aug_hi * 10)) - int(round(aug_lo * 10)) + 1 < N_AUG:
+        return (f"❌ 增强 clip 范围过窄：上下限差至少需 0.{N_AUG - 1} "
+                f"（0.1 步长才能采出 {N_AUG} 个不同 clip 值）", gr.update(), gr.update())
+    try:
         job = JM.create_job(path, sort_keys, gkeys, values,
-                            float(clip if clip is not None else 99.0),
-                            title, user, endian=endian, min_traces=min_traces)
+                            clip, title, user, endian=endian, min_traces=min_traces,
+                            aug_lo=aug_lo, aug_hi=aug_hi)
     except (JobError, SegyReadError) as e:
         return f"❌ {e}", gr.update(), gr.update()
     n = len(job.gather_ids())
@@ -305,7 +320,8 @@ def create_job_ui(request: gr.Request, path, endian_text, sort_text, gkey_text,
     note = f"（已滤去 {dropped} 个道数 < {min_traces} 的道集）" if dropped else ""
     job_choices = _job_choices(user)
     mgr_choices = [j["job_id"] for j in JM.list_jobs()]
-    return (f"✔ 已创建作业 {job.job_id}（键 {ranges_label(gkeys)}）｜道集数 {n}{note}",
+    return (f"✔ 已创建作业 {job.job_id}（键 {ranges_label(gkeys)}）｜道集数 {n}{note}"
+            f"｜保存时每张增强 {N_AUG} 个随机 clip",
             gr.update(choices=job_choices, value=job.job_id),
             gr.update(choices=mgr_choices, value=job.job_id))
 
@@ -418,6 +434,29 @@ def apply_drag_box(user: str, key: str, x0, y0, x1, y1) -> tuple[bool, str]:
     return True, key
 
 
+def _boxes_payload(user: str) -> dict:
+    """当前道集各 bbox 特征的框（自然像素 xyxy，与导出图 512×1024 同系）。
+
+    供 GET /api/boxes：前端在显示图/重开时拉取本道集已有框，用于叠加可编辑手柄。
+    优先读本会话 st['boxes']；重开已保存记录时回退到 labels 记录 regions。
+    """
+    st = wstate(user)
+    out = {}
+    if st.get("job_id") and st.get("gid"):
+        try:
+            job = JM.get(st["job_id"])
+        except JobError:
+            return out
+        boxes = _current_boxes(job, st["gid"], st)
+        for f in bbox_feats():
+            b = boxes.get(f.key)
+            if b and b.get("xyxy"):
+                x0, y0, x1, y1 = b["xyxy"]
+                out[f.key] = {"x0": int(x0), "y0": int(y0),
+                              "x1": int(x1), "y1": int(y1)}
+    return out
+
+
 def save_anno(request: gr.Request, *radio_values):
     user = _user(request)
     st = wstate(user)
@@ -442,13 +481,14 @@ def save_anno(request: gr.Request, *radio_values):
                     cur[2], *cur[3:])
         st["gid"] = gid   # claim 已把同 gid 重新发回（保持 state 一致）
     # 框来源：st["boxes"] 有暂存则用之，否则回退到已存记录 regions（重开编辑场景）
-    ok, rec, err = JM.save(job_id, user, gid, sel, _current_boxes(JM.get(job_id), gid, st),
-                           is_admin=_is_admin(user))
+    ok, rec, aug_recs, err = JM.save(job_id, user, gid,
+                                     sel, _current_boxes(JM.get(job_id), gid, st),
+                                     is_admin=_is_admin(user))
     if not ok:
         cur = show_current(request)
         return (cur[0], "⚠️ " + err, cur[2], *cur[3:])
-    # 云上传（异步，失败绝不阻塞/回滚标注）
-    rels = [rec["image_path"]] if rec.get("image_path") else []
+    # 云上传（异步，失败绝不阻塞/回滚标注）：本次落盘的 N_AUG 张增强图 + labels.jsonl
+    rels = [a["image_path"] for a in aug_recs if a.get("image_path")]
     rels.append("labels.jsonl")
     UP.enqueue(job_id, JM.get(job_id).output_dir, rels)
     n_labeled, total = JM.progress(job_id)
@@ -472,7 +512,8 @@ def save_anno(request: gr.Request, *radio_values):
     st["pending_corner"] = None
     cur = show_current(request)
     return (cur[0],
-            f"✔ 已保存「{rec['gather_id']}」| 作业进度 {n_labeled}/{total} | 已自动领取下一张",
+            f"✔ 已保存「{rec['gather_id']}」× {len(aug_recs)} 张增强图 | 作业进度 "
+            f"{n_labeled}/{total} | 已自动领取下一张",
             cur[2], *cur[3:])
 
 
@@ -826,150 +867,277 @@ _DRAG_BBOX = [[f.key, f.name, f.bbox_color] for f in CFG.features if f.bbox]
 ANNO_JS = """
 <style>
 #anno_imgcol .image-container { position: relative; }
+#anno_imgcol .image-container img { cursor: crosshair; }
 #anno_drag_canvas {
     position: absolute; pointer-events: none; z-index: 50;
     image-rendering: auto; border: 0; touch-action: none;
 }
-#anno_drag_canvas.active { pointer-events: auto; cursor: crosshair; }
 </style>
 <script>
 (function(){
   const BBOX = __DRAG_BBOX__;
   const KEY2COLOR = {}; BBOX.forEach(function(b){ KEY2COLOR[b[0]] = b[2] || '#ff0000'; });
-  let activeFeat = null;            // 正在框选的特征；null=画布不拦截指针
-  const committed = {};             // 已提交矩形: key -> {x0,y0,x1,y1}（每个特征一个）
-  let dragging = false, startPt = null, curPt = null;
-  let canvas = null, bound = false, lastSrc = '';
+  let boxes = {};          // key -> {x0,y0,x1,y1}，坐标 = 图片自然像素（导出图固定 512×1024）
+  let drawKey = null;      // 点了「▣框选」等待新画/重画的特征；null = 可拖动/缩放已有框
+  let grab = null;         // 当前手势 {type:draw|move|resize, key, ...}
+  let canvas = null, lastSrc = '';
+  const MIN = 4;           // 最小边长（自然像素）
 
-  function getWrap(){ return document.querySelector('#anno_imgcol .image-container'); }
   function getImg(){
     var im = document.querySelector('#anno_imgcol .image-container img');
     return (im && im.complete && im.naturalWidth) ? im : null;
   }
+  // 取当前登录用户：优先读账号栏渲染后的 <code>（markdown 反引号渲染后不再是文本反引号）
+  function currentUser(){
+    var md = document.getElementById('who_md'); if (!md) return null;
+    var code = md.querySelector('code');
+    if (code){ var u = (code.textContent || '').trim(); if (u) return u; }
+    var t = md.textContent || '';
+    var i = t.indexOf('当前用户');            // 兜底：渲染后文本形如 "当前用户：boss（admin）"
+    if (i >= 0){
+      var seg = t.slice(i + '当前用户'.length);
+      var j = seg.search(/[：:]/); if (j >= 0) seg = seg.slice(j + 1);
+      seg = seg.trim();
+      var cut = seg.search(/[（( ]/);
+      var name = (cut >= 0 ? seg.slice(0, cut) : seg).trim();
+      if (name) return name;
+    }
+    return null;
+  }
   function ensureCanvas(){
-    var w = getWrap(); if (!w) return null;
+    var w = document.querySelector('#anno_imgcol .image-container'); if (!w) return null;
     var cv = document.getElementById('anno_drag_canvas');
     if (!cv){ cv = document.createElement('canvas'); cv.id = 'anno_drag_canvas'; w.appendChild(cv); }
-    if (!bound && cv){
-      cv.addEventListener('pointerdown', onDown);
-      cv.addEventListener('pointermove', onMove);
-      cv.addEventListener('pointerup', onUp);
-      cv.addEventListener('pointercancel', onUp);
-      bound = true;
-    }
+    cv.style.pointerEvents = 'none';          // 指针一律透传给下层 <img>
     return cv;
   }
-  function clearPixels(){
-    if (!canvas) return;
-    var c = canvas.getContext('2d'); c.clearRect(0,0,canvas.width,canvas.height);
+  // 指针事件绑在 <img> 上（它始终在接收事件，不受画布时序/重建影响）
+  function bindImg(im){
+    if (!im || im.__annoBound) return;
+    im.__annoBound = true;
+    im.addEventListener('pointerdown', onDown);
+    im.addEventListener('pointermove', onMove);
+    im.addEventListener('pointerup', onUp);
+    im.addEventListener('pointercancel', onCancel);
+    im.addEventListener('pointerleave', onLeave);
+  }
+  function clamp(v, a, b2){ return Math.max(a, Math.min(b2, v)); }
+  function imgRect(){
+    var im = (canvas && canvas._img) ? canvas._img : getImg();
+    return im ? im.getBoundingClientRect() : null;
+  }
+  // 局部(0..图片显示宽) -> 自然像素；绘制/命中/指针统一按同一矩形换算
+  function localToNat(lx, ly){
+    var im = (canvas && canvas._img) ? canvas._img : getImg();
+    var r = imgRect();
+    if (!im || !r || !r.width || !r.height) return null;
+    return [Math.max(0, Math.min(im.naturalWidth - 1, lx / r.width  * im.naturalWidth)),
+            Math.max(0, Math.min(im.naturalHeight - 1, ly / r.height * im.naturalHeight))];
+  }
+  function screenRect(b){                       // 自然像素 -> 局部(0..显示宽高)
+    var im = (canvas && canvas._img) ? canvas._img : getImg();
+    var r = imgRect(); if (!im || !r) return {x:0,y:0,w:0,h:0};
+    return {x: b.x0/im.naturalWidth*r.width,  y: b.y0/im.naturalHeight*r.height,
+            w: (b.x1-b.x0)/im.naturalWidth*r.width, h: (b.y1-b.y0)/im.naturalHeight*r.height};
+  }
+  function copyBox(b){ return {x0:b.x0, y0:b.y0, x1:b.x1, y1:b.y1}; }
+  function natCorner(b, which){
+    switch(which){
+      case 'nw': return [b.x0, b.y0];
+      case 'ne': return [b.x1, b.y0];
+      case 'sw': return [b.x0, b.y1];
+      default:   return [b.x1, b.y1];
+    }
   }
   function redraw(){
-    clearPixels();
-    if (!canvas || !canvas._img || !canvas._rect) return;
-    var N = canvas._img, r = canvas._rect;
-    var c = canvas.getContext('2d'); c.lineWidth = 3; c.setLineDash([]);   // 粗实线
-    for (var key in committed){
-      var box = committed[key];
-      var px = box.x0/N.naturalWidth*r.width, py = box.y0/N.naturalHeight*r.height;
-      var pw = (box.x1-box.x0)/N.naturalWidth*r.width, ph = (box.y1-box.y0)/N.naturalHeight*r.height;
-      c.strokeStyle = KEY2COLOR[key] || '#1f6feb';
-      c.strokeRect(px, py, pw, ph);
+    if (!canvas) return;
+    var c = canvas.getContext('2d');
+    c.clearRect(0, 0, canvas.width, canvas.height);
+    if (!canvas._img) return;
+    var hs = Math.max(7, Math.min(14, Math.round(canvas.width * 0.02) || 9));
+    for (var key in boxes){
+      var b = boxes[key]; if (!b) continue;
+      var s = screenRect(b), col = KEY2COLOR[key] || '#1f6feb';
+      c.strokeStyle = col;
+      c.lineWidth = (grab && grab.key === key) ? 4 : 3;
+      c.strokeRect(s.x, s.y, s.w, s.h);
+      var pts = [[s.x,s.y],[s.x+s.w,s.y],[s.x,s.y+s.h],[s.x+s.w,s.y+s.h]];
+      for (var i = 0; i < pts.length; i++){
+        var px = pts[i][0], py = pts[i][1];
+        c.fillStyle = col; c.fillRect(px - hs/2, py - hs/2, hs, hs);
+        c.fillStyle = '#ffffff'; c.fillRect(px - hs/4, py - hs/4, hs/2, hs/2);
+      }
     }
   }
   function place(){
-    var w = getWrap(), img = getImg();
+    var w = document.querySelector('#anno_imgcol .image-container');
+    var img = getImg();
     canvas = ensureCanvas();
     if (!canvas) return;
     if (!w || !img){ canvas.style.display = 'none'; return; }
-    if (img.currentSrc && img.currentSrc !== lastSrc){
-      lastSrc = img.currentSrc;          // 换了道集 → 清掉旧矩形
-      for (var k in committed) delete committed[k];
+    bindImg(img);
+    if (img.currentSrc && img.currentSrc !== lastSrc){   // 换了道集/重开 → 清本地并回填服务器
+      lastSrc = img.currentSrc;
+      boxes = {}; grab = null; drawKey = null;
+      fetchBoxes();
     }
     var cr = w.getBoundingClientRect(), ir = img.getBoundingClientRect();
     canvas.style.display = '';
     canvas.style.left = (ir.left - cr.left) + 'px';
     canvas.style.top  = (ir.top  - cr.top)  + 'px';
-    canvas.style.width  = Math.round(ir.width) + 'px';
+    canvas.style.width  = Math.round(ir.width)  + 'px';
     canvas.style.height = Math.round(ir.height) + 'px';
     canvas.width  = Math.round(ir.width);
     canvas.height = Math.round(ir.height);
     canvas._img = img; canvas._rect = ir;
-    canvas.classList.toggle('active', !!activeFeat);
     redraw();
   }
-  function toNat(p){
-    if (!canvas._img || !canvas._rect) return null;
-    var r = canvas._rect;
-    var nx = (p.x - r.left) / r.width  * canvas._img.naturalWidth;
-    var ny = (p.y - r.top)  / r.height * canvas._img.naturalHeight;
-    return [Math.max(0, Math.min(canvas._img.naturalWidth-1, nx)),
-            Math.max(0, Math.min(canvas._img.naturalHeight-1, ny))];
+  function fetchBoxes(){
+    var u = currentUser(); if (!u) return;
+    fetch('/api/boxes?user=' + encodeURIComponent(u), {headers:{'Accept':'application/json'}})
+      .then(function(r){ return r.ok ? r.json() : {boxes:{}}; })
+      .then(function(d){ if (d && d.boxes){ boxes = d.boxes || {}; if (!grab) redraw(); } })
+      .catch(function(){});
   }
-  function drawLive(){
-    clearPixels(); redraw();            // 先画已提交，再叠当前虚线
-    if (!startPt || !curPt || !canvas._img || !canvas._rect) return;
-    var a = toNat(startPt), b = toNat(curPt); if (!a || !b) return;
-    var N = canvas._img, r = canvas._rect;
-    var sx = Math.min(a[0],b[0]), sy = Math.min(a[1],b[1]), ex = Math.max(a[0],b[0]), ey = Math.max(a[1],b[1]);
-    var px = sx/N.naturalWidth*r.width, py = sy/N.naturalHeight*r.height;
-    var pw = (ex-sx)/N.naturalWidth*r.width, ph = (ey-sy)/N.naturalHeight*r.height;
-    var c = canvas.getContext('2d');
-    c.strokeStyle = KEY2COLOR[activeFeat] || '#1f6feb';
-    c.lineWidth = 3; c.setLineDash([]);   // 拖动中也是粗实线
-    c.strokeRect(px, py, pw, ph);
+  function localPt(e){
+    var r = imgRect();
+    if (!r) return null;
+    return {x: e.clientX - r.left, y: e.clientY - r.top};
   }
+  // ---- 命中检测（局部坐标 0..显示宽高）----
+  function hitTest(x, y){
+    if (!canvas || !canvas._img) return null;
+    var tol = Math.max(9, Math.round(canvas.width * 0.02));
+    for (var key in boxes){
+      var b = boxes[key]; if (!b) continue;
+      var s = screenRect(b);
+      var corners = {nw:[s.x,s.y], ne:[s.x+s.w,s.y], sw:[s.x,s.y+s.h], se:[s.x+s.w,s.y+s.h]};
+      for (var cName in corners){
+        var p = corners[cName];
+        if (Math.abs(p[0]-x) <= tol && Math.abs(p[1]-y) <= tol) return {type:'resize', key:key, corner:cName};
+      }
+      if (x >= s.x && x <= s.x+s.w && y >= s.y && y <= s.y+s.h) return {type:'move', key:key};
+    }
+    return null;
+  }
+  // ---- 交互（全部以图片局部坐标运算，与绘制同系）----
   function onDown(e){
-    if (!activeFeat) return;
-    dragging = true; startPt = {x:e.clientX, y:e.clientY}; curPt = startPt;
-    if (canvas.setPointerCapture) canvas.setPointerCapture(e.pointerId);
-    drawLive(); e.preventDefault();
-  }
-  function onMove(e){ if (!dragging) return; curPt = {x:e.clientX, y:e.clientY}; drawLive(); e.preventDefault(); }
-  function onUp(e){
-    if (!dragging) return; dragging = false;
-    curPt = {x:e.clientX, y:e.clientY};
-    var a = toNat(startPt), b = toNat(curPt); startPt = curPt = null;
-    if (a && b){
-      var key = activeFeat;
-      committed[key] = { x0: Math.round(Math.min(a[0],b[0])), y0: Math.round(Math.min(a[1],b[1])),
-                         x1: Math.round(Math.max(a[0],b[0])), y1: Math.round(Math.max(a[1],b[1])) };
-      activeFeat = null;                       // 提交后不再拦截（防误拖覆盖）
-      canvas.classList.remove('active');
-      var user = currentUser();
-      if (user){
-        var box = committed[key];
-        fetch('/api/anno_box', { method:'POST', headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({user:user, key:key, x0:box.x0, y0:box.y0, x1:box.x1, y1:box.y1}) })
-          .catch(function(){});
+    if (!canvas || !canvas._img) return;
+    var lp = localPt(e); if (!lp) return;
+    var nat = localToNat(lp.x, lp.y); if (!nat) return;
+    e.preventDefault(); e.stopPropagation();
+    if (drawKey){                                   // 拖新框（重画该特征）
+      grab = {type:'draw', key:drawKey,
+              snapshot: boxes[drawKey] ? copyBox(boxes[drawKey]) : null, down:nat};
+      boxes[drawKey] = {x0:nat[0], y0:nat[1], x1:nat[0], y1:nat[1]};
+    } else {
+      var hit = hitTest(lp.x, lp.y);
+      if (!hit) return;                             // 空白区点击不做任何事
+      var key = hit.key;
+      grab = hit;
+      grab.snapshot = boxes[key] ? copyBox(boxes[key]) : null;
+      if (hit.type === 'resize'){
+        var opp = {nw:'se', se:'nw', ne:'sw', sw:'ne'}[hit.corner];
+        grab.anchorNat = natCorner(boxes[key], opp);   // 对角锚点（自然像素，固定）
+      } else {
+        grab.nat0 = nat;                              // 整体移动起点
       }
     }
+    if (e.target.setPointerCapture){ try { e.target.setPointerCapture(e.pointerId); } catch(_){} }
     redraw();
   }
-  function currentUser(){
-    var md = document.getElementById('who_md'); var t = md ? (md.textContent||'') : '';
-    var m = t.match(/`([^`]+)`/); return m ? m[1] : null;
+  function onMove(e){
+    if (!canvas || !canvas._img) return;
+    var lp = localPt(e); if (!lp) return;
+    if (!grab){                                     // 悬停：仅更新光标提示
+      if (drawKey){ if(e.target.style) e.target.style.cursor = 'crosshair'; return; }
+      var h = hitTest(lp.x, lp.y);
+      var cur = h ? (h.type === 'move' ? 'move'
+                     : (h.corner === 'nw' || h.corner === 'se') ? 'nwse-resize' : 'nesw-resize')
+                  : 'crosshair';
+      if (e.target.style) e.target.style.cursor = cur;
+      return;
+    }
+    e.preventDefault();
+    var nat = localToNat(lp.x, lp.y); if (!nat) return;
+    var g = grab, key = g.key, im = canvas._img;
+    var b = boxes[key] || {x0:0, y0:0, x1:0, y1:0};
+    var W = im.naturalWidth - 1, H = im.naturalHeight - 1;
+    if (g.type === 'draw'){
+      b.x0 = Math.round(clamp(Math.min(g.down[0], nat[0]), 0, W));
+      b.y0 = Math.round(clamp(Math.min(g.down[1], nat[1]), 0, H));
+      b.x1 = Math.round(clamp(Math.max(g.down[0], nat[0]), 0, W));
+      b.y1 = Math.round(clamp(Math.max(g.down[1], nat[1]), 0, H));
+    } else if (g.type === 'move'){
+      var dx = nat[0] - g.nat0[0], dy = nat[1] - g.nat0[1];
+      var w0 = g.snapshot.x1 - g.snapshot.x0, h0 = g.snapshot.y1 - g.snapshot.y0;
+      b.x0 = Math.round(clamp(g.snapshot.x0 + dx, 0, W - w0));
+      b.y0 = Math.round(clamp(g.snapshot.y0 + dy, 0, H - h0));
+      b.x1 = b.x0 + w0; b.y1 = b.y0 + h0;
+    } else if (g.type === 'resize'){
+      var A = g.anchorNat;
+      var nx = clamp(nat[0], 0, W), ny = clamp(nat[1], 0, H);
+      if (g.corner === 'nw'){ b.x0 = Math.round(clamp(nx, 0, A[0] - MIN)); b.y0 = Math.round(clamp(ny, 0, A[1] - MIN)); }
+      else if (g.corner === 'se'){ b.x1 = Math.round(clamp(nx, A[0] + MIN, W)); b.y1 = Math.round(clamp(ny, A[1] + MIN, H)); }
+      else if (g.corner === 'ne'){ b.x1 = Math.round(clamp(nx, A[0] + MIN, W)); b.y0 = Math.round(clamp(ny, 0, A[1] - MIN)); }
+      else if (g.corner === 'sw'){ b.x0 = Math.round(clamp(nx, 0, A[0] - MIN)); b.y1 = Math.round(clamp(ny, A[1] + MIN, H)); }
+    }
+    boxes[key] = b;
+    redraw();
   }
-  function setActive(key){ activeFeat = key; place(); }
-  function clearKey(key){ activeFeat = null; delete committed[key]; place(); }
+  function postBox(key, b){
+    var u = currentUser(); if (!u) return;
+    fetch('/api/anno_box', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({user:u, key:key, x0:b.x0, y0:b.y0, x1:b.x1, y1:b.y1})})
+      .catch(function(){});
+  }
+  function endGesture(e, commit){
+    if (!grab) return;
+    var g = grab; grab = null;
+    if (e.target && e.target.setPointerCapture){ try { e.target.releasePointerCapture(e.pointerId); } catch(_){} }
+    var b = boxes[g.key];
+    var ok = b && (b.x1 - b.x0) >= MIN && (b.y1 - b.y0) >= MIN;
+    if (commit && ok){
+      b.x0 = Math.round(b.x0); b.y0 = Math.round(b.y0);
+      b.x1 = Math.round(b.x1); b.y1 = Math.round(b.y1);
+      boxes[g.key] = b;
+      if (g.type === 'draw') drawKey = null;        // 画完即回到编辑态（可拖动/缩放）
+      postBox(g.key, b);
+    } else {
+      if (g.snapshot) boxes[g.key] = g.snapshot;
+      else delete boxes[g.key];
+      if (g.type !== 'draw') drawKey = null;
+    }
+    if (e.target && e.target.style) e.target.style.cursor = drawKey ? 'crosshair' : '';
+    redraw();
+  }
+  function onUp(e){ endGesture(e, true); }
+  function onCancel(e){ endGesture(e, false); }
+  function onLeave(e){ if (e.target && e.target.style) e.target.style.cursor = drawKey ? 'crosshair' : ''; }
+  // ---- 按钮联动 ----
+  function setDraw(key){ drawKey = key; if (canvas) { redraw(); place(); } }
+  function clearKey(key){ drawKey = null; delete boxes[key]; if (canvas) { redraw(); place(); } }
   function setup(){
     document.addEventListener('click', function(e){
       var t = e.target && e.target.closest ? e.target.closest('[id^="bb-"]') : null;
-      if (t){ var k = (t.id || '').replace(/^bb-/, ''); if (KEY2COLOR[k] !== undefined) setActive(k); }
+      if (t){ var k = (t.id || '').replace(/^bb-/, ''); if (KEY2COLOR[k] !== undefined) setDraw(k); }
     });
     document.addEventListener('click', function(e){
       var t = e.target && e.target.closest ? e.target.closest('[id^="cb-"]') : null;
       if (t){ var k = (t.id || '').replace(/^cb-/, ''); if (KEY2COLOR[k] !== undefined) clearKey(k); }
     });
-    window.addEventListener('resize', function(){ if (!dragging) place(); });
-    // 监听持久存在的 #anno_imgcol 列：领取道集 / 图 src 变化 / 组件重挂载都会触发重定位
+    window.addEventListener('resize', function(){ if (!grab) place(); });
+    window.addEventListener('scroll', function(){ if (!grab) place(); }, true);
     var root = document.getElementById('anno_imgcol') || document.body;
     if (window.MutationObserver){
-      new MutationObserver(function(){ if (!dragging) place(); })
-        .observe(root, { childList:true, subtree:true, attributes:true, attributeFilter:['src','class'] });
+      new MutationObserver(function(){ if (!grab) place(); })
+        .observe(root, {childList:true, subtree:true, attributes:true, attributeFilter:['src','class']});
     }
     window.addEventListener('load', function(ev){
       if (ev.target && ev.target.tagName === 'IMG' && ev.target.closest && ev.target.closest('#anno_imgcol')) place();
     }, true);
+    // 兜底：图片加载/重渲染时序不稳时，周期校正画布位置与 img 事件绑定
+    setInterval(function(){ if (!grab){ var im = getImg(); if (im) place(); } }, 900);
     place();
   }
   var tries = 0;
@@ -1011,11 +1179,17 @@ def build_app() -> gr.Blocks:
             values_box = gr.CheckboxGroup(choices=[], value=[], label="键值（勾选要抽取的）")
             scan_info = gr.Markdown("")
             with gr.Row():
-                clip = gr.Number(label="clip 分位数 (%)", value=99.0, minimum=50, maximum=100)
+                clip = gr.Number(label="预览 clip 分位数 (%)（仅界面显示/画框参照）",
+                                 value=99.0, minimum=50, maximum=100)
+                aug_lo = gr.Number(label="增强 clip 下限 (%)", value=90.0, minimum=1,
+                                   maximum=100)
+                aug_hi = gr.Number(label="增强 clip 上限 (%)", value=99.9, minimum=1,
+                                   maximum=100)
                 title = gr.Textbox(label="作业标题（可空，默认=文件名）")
             with gr.Row():
                 min_traces = gr.Number(label="道数下限（道数 < 该值的道集不参与标注，0=不限）",
-                                       value=0, minimum=0, precision=0)
+                                       value=20, minimum=0, precision=0)
+                build_hint = gr.Markdown(f"保存标注时每张道集将随机采 **{N_AUG} 个不同 clip 值**各渲一张导出图")
             btn_create = gr.Button("创建作业", variant="primary")
             build_info = gr.Markdown("")
 
@@ -1083,7 +1257,8 @@ def build_app() -> gr.Blocks:
         btn_load.click(load_file, [file_path, endian], file_info)
         btn_scan.click(scan_values, [file_path, endian, gkey], [values_box, scan_info])
         btn_create.click(create_job_ui,
-                         [file_path, endian, sort_keys, gkey, values_box, clip, title, min_traces],
+                         [file_path, endian, sort_keys, gkey, values_box, clip,
+                          aug_lo, aug_hi, title, min_traces],
                          [build_info, job_dd, mgr_job_dd])
 
         anno_outputs = [cur_img, anno_info, sentence, *radios, *box_statuses]
@@ -1149,6 +1324,14 @@ def main():
         except Exception as e:                       # noqa: BLE001 —— 统一转 400 提示
             return JSONResponse({"ok": False, "err": str(e)}, status_code=400)
         return {"ok": ok, "msg": msg}
+
+    @app.get("/api/boxes")
+    async def anno_boxes(user: str = ""):
+        """读取当前道集各 bbox 特征的框（自然像素 xyxy），供前端初始化/重开编辑。"""
+        user = (user or "").strip()
+        if not user or ACC.role(user) is None:
+            return JSONResponse({"ok": False, "err": "unknown user"}, status_code=401)
+        return {"ok": True, "boxes": _boxes_payload(user)}
 
     gr.mount_gradio_app(app, demo, path="/", auth=ACC.authenticate, css=ANNO_CSS,
                         head=ANNO_JS,

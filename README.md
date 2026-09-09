@@ -10,7 +10,8 @@
 - Web 标注界面（Gradio）：浏览器即用，支持断点续标、多文件合并标注
 - 8 项特征标签体系，配置驱动（改 `label_config.yaml` 即可增删特征，无需改代码）
 - 面波 / 近炮点强能量噪声支持**矩形框选**（检测训练用，像素 + 原始数据双坐标）
-- clip 随机采样数据增强：一个道集自动产出 N 张不同 clip 的训练图
+- clip 随机采样数据增强：保存一张道集即自动产出 **5 张不同随机 clip** 的训练图
+  （clip 上下限在建作业时设置）
 - 每条记录自动渲染自然语言句子（句子模板可配置）
 
 ## 多人协作标注（v3）—— 同局域网多人 + 云回传
@@ -42,9 +43,16 @@ python web_app.py            # 默认 0.0.0.0:7860，可加 --host / --port
 ### 建作业（admin）
 
 - admin 登录后在「① 建作业」填 sgy 路径、排序键、抽道集键，勾选要抽的键值，
-  设 clip 分位数后「创建作业」。
+  再设三个 clip 参数后「创建作业」：
+  - **预览 clip 分位数**（默认 99，仅界面显示/画框参照用）；
+  - **增强 clip 下限 / 上限**（默认 90 / 99.9）——每次保存时从该范围随机采
+    **5 个互不相同的 clip 值**，各渲一张增强导出图（范围须宽到能采满 5 个，0.1 步长）；
+  - **道数下限**（默认 20，0=不限）：道数少于该值的道集从作业池滤去、不标注。
 - 服务端抽一次道集即生成一个作业，落在 `jobs/<job_id>/`；标注者之后从该作业的
   任务池按顺序领一张标一张。
+
+> ⚠️ **旧版作业（v3.5 及以前建、job.json 无增强上下限）不兼容**：重启后会被标为
+> 「异常」，无法领取/保存，需在管理③区删除后按新参数重建。
 
 ### 任务池领取语义（标注）
 
@@ -58,28 +66,34 @@ python web_app.py            # 默认 0.0.0.0:7860，可加 --host / --port
 
 ```
 jobs/<job_id>/
-├── job.json         # 作业元数据
-├── labels.jsonl     # 标注记录（每行一条，含 annotated_by 标注者）
-├── images/          # 导出图（纯数据图，512×1024）
+├── job.json         # 作业元数据（含 clip_percentile 预览、aug_lo/aug_hi 增强范围等）
+├── labels.jsonl     # 标注记录：每张道集 1 条基础记录 + 5 条增强记录
+├── images/          # 导出增强图 images/<gid>__clip<值>.png（纯数据图，512×1024）
 └── npy/             # 原始数据 float32（留本地，不上云）
 ```
+
+- 保存一张道集：基础记录（`gather_id=<gid>`，`image_path: null`，用于断点/进度/重开）
+  + **5 条增强记录**（`gather_id=<gid>__clip<值>`、`augmented_from=<gid>`、`clip_percentile`=值），
+  每条 labels/sentence/regions 与基础一致（区域坐标按道/采样换算，天然与 clip 无关）；
+  图片与记录一一对应，无孤立图。重复保存同一道集自动清理旧增强后再采样，不会堆积。
 
 ### 开启 COS 云回传（可选）
 
 - 编辑项目根目录 `cos_config.yaml`：`enabled: true` 并填 `secret_id / secret_key /
   bucket / region`（密钥只存本机，永不进代码/日志），保存后**重启服务**生效。
 - 依赖：`pip install cos-python-sdk-v5`；未启用或未装依赖时安全降级为本地模式，不阻塞标注。
-- 保存成功后异步上传该条图片 + 整份 `labels.jsonl`，对象键为
-  `seismic/<job_id>/images/<gather_id>.png`、`seismic/<job_id>/labels.jsonl`；
-  失败自动有界重试并写 `jobs/<job_id>/upload.log`，admin 可「全部重传」重推。
+- 保存成功后异步上传本次落盘的 **5 张增强图** + 整份 `labels.jsonl`，对象键为
+  `seismic/<job_id>/images/<gid>__clip<值>.png`、`seismic/<job_id>/labels.jsonl`；
+  失败自动有界重试并写 `jobs/<job_id>/upload.log`，admin 可「全部重传」重推
+  （重传按目录扫 `images/*.png` 全量上）。
 - `npy`（原始数据）按设计**只留本地，不上云**。
 
-### 数据增强（离线，不进标注循环）
+### 数据增强：内置（保存即做）+ 离线脚本（可选）
 
-- v3 起标注保存**不再内嵌增强**（多人对同一作业无法各自设增强参数，且增强记录与
-  基础记录标签完全相同），增强改为标注完成后的离线后处理。
-- 沿用现有 `backfill_augment.py` 脚本原用法，参数指向该作业目录下的 `labels.jsonl` 即可
-  （脚本从同目录 `npy/` 读原始数据、向 `images/` 渲染增强图并增补 `augmented_from` 记录）：
+- **v3.6 起增强内置回标注循环**：保存一张道集自动按作业的增强 clip 范围随机采
+  5 个值、渲染 5 张增强图并各写一条 `augmented_from` 记录（即上方「结果落点」语义），
+  无需再额外跑脚本。
+- 若历史数据是单图基础记录、想补成 clip 采样增强，仍可离线跑 `backfill_augment.py`：
 
 ```bash
 python backfill_augment.py jobs/<job_id>/labels.jsonl    # 默认每条 5 张，可加张数参数
@@ -181,9 +195,9 @@ ssh -L 5900:localhost:5900 <用户名>@<服务器地址>
 
 ```
 输出目录/
-├── labels.jsonl          # 每行一条道集记录
-├── images/<文件名前缀>__<键>_<值>.png  # 纯数据图：无坐标轴/标题，固定 512×1024（宽×高）RGB
-└── npy/<文件名前缀>__<键>_<值>.npy     # 原始数据：float32 (道数,采样点数)，无预处理，供数据增强
+├── labels.jsonl          # 每张道集 = 1 基础行 + 5 增强行
+├── images/<文件名前缀>__<键>_<值>__clip<值>.png   # 增强导出图（每张道集 5 张），纯数据图 512×1024 RGB
+└── npy/<文件名前缀>__<键>_<值>.npy                # 原始数据：float32 (道数,采样点数)，无预处理，供重渲染各 clip
 ```
 
 JSONL 单条示例：
@@ -206,6 +220,11 @@ JSONL 单条示例：
   "timestamp": "2026-08-21T00:40:00"
 }
 ```
+
+> **v3.6 起多用户版的真实落点**：基础行 `image_path` 为 `null`；同时写 **5 条增强行**——
+> 在基础行字段之上把 `gather_id` 换成 `<gid>__clip<值>` 并追加
+> `"augmented_from": "<gid>"`、`"clip_percentile": <值>`、`"image_path"` 指向对应 clip 图
+> （`images/<gid>__clip<值>.png`）。上面示例为旧版单图记录形态，仅作字段结构参考。
 
 **`regions` 字段**（仅 `label_config.yaml` 中 `bbox: true` 的特征有）：同一块区域的两套坐标——
 
