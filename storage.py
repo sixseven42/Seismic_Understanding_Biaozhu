@@ -8,7 +8,7 @@ storage.py — 标注结果存储（JSONL）与断点续标
   "gather_key": "95-96",
   "gather_value": 1373,
   "n_traces": 528,
-  "labels": {"gather_type": "炮集", "statics": "需要", ...},
+  "labels": {"gather_type": "炮集", "surface_wave": "已压制但有残留", ...},
   "sentence": "这是一条炮集，……。",
   "image_path": "images/shot_1373.png",
   "source_file": "/path/to/xxx.sgy",

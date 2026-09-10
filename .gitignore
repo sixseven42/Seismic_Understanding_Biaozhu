@@ -14,3 +14,17 @@ cos_config.yaml
 users.yaml
 *.log
 nul
+
+# 编辑器/系统/模型权重/地震数据（公开仓库尤其不该入库）
+.venv/
+env/
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.ckpt
+*.pth
+*.npy
+*.npz
+*.mat
+*.sgy

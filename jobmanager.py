@@ -11,7 +11,7 @@ from datetime import datetime
 import numpy as np
 
 from gather import Gather, extract_gathers, key_str, ranges_label
-from preprocess import apply_pipeline, sample_clip_values
+from preprocess import apply_pipeline, clip_bound, sample_clip_values
 from storage import LabelStore
 from imaging import render_data_only
 
@@ -46,6 +46,14 @@ class Job:
         # 视为「需重建」——不能保存、load_all 会将其标 broken。
         self.aug_lo, self.aug_hi = self._read_aug(meta)
         self.ns = int(ns)
+        # 采样间隔（毫秒）：面波区「滤波」按它把角频率换算到 FFT 频点。0 = 未知 →
+        # 拒绝滤波（宁可不出图，也不能按猜的 dt 画错通带位置误导标注）。
+        try:
+            self.dt_ms = float(meta.get("dt_ms") or 0.0)
+        except (TypeError, ValueError):
+            self.dt_ms = 0.0
+        if self.dt_ms <= 0:
+            self.dt_ms = 0.0
         self._gathers = gathers
         self._by_id = {g.gather_id: g for g in gathers}
         self._provider = provider
@@ -88,9 +96,47 @@ class Job:
     def raw(self, gid: str) -> np.ndarray:
         return np.asarray(self._provider(self.gather(gid)), dtype=np.float32)
 
-    def display(self, gid: str) -> np.ndarray:
-        return apply_pipeline(self.raw(gid),
-                              [{"name": "clip_percentile", "params": {"percentile": self.clip}}])
+    @staticmethod
+    def _bandpass_params(bandpass) -> dict | None:
+        """归一化滤波参数：无滤波返回 None，四角缺一/非数值抛 JobError。
+
+        绝不静默回落到「不滤波」——否则界面点了滤波却给出未滤波的图。
+        """
+        if not bandpass:
+            return None
+        try:
+            return {k: float(bandpass[k]) for k in ("f1", "f2", "f3", "f4")}
+        except (KeyError, TypeError, ValueError):
+            raise JobError("滤波参数缺失或非数值")
+
+    def display_vlim(self, gid: str) -> float:
+        """显示色标界限：**只从原始数据**按预览 clip 分位算一次。
+
+        滤波前后共用同一个界限 → 两张图色标一致、可直接对比；滤波压掉的能量
+        会真的显示为变淡，而不是被重新拉伸回满对比度。
+        """
+        return clip_bound(self.raw(gid), self.clip)
+
+    def _display_data(self, gid: str, bandpass: dict | None, vlim: float) -> np.ndarray:
+        bp = self._bandpass_params(bandpass)
+        steps = []
+        if bp is not None:
+            if self.dt_ms <= 0:
+                raise JobError("无法确定采样间隔（job.json 缺 dt_ms），不能对显示图做滤波")
+            steps.append({"name": "bandpass", "params": {**bp, "dt_ms": self.dt_ms}})
+        steps.append({"name": "clip_abs", "params": {"vlim": vlim}})
+        try:
+            return apply_pipeline(self.raw(gid), steps)
+        except ValueError as e:                      # preprocess 的参数校验
+            raise JobError(str(e))
+
+    def display(self, gid: str, bandpass: dict | None = None) -> np.ndarray:
+        """界面显示数据：原始道集 →（可选）带通滤波 → 按共用色标截断。
+
+        滤波只作用于「看」：导出图在 save 时由 self.raw() 渲染，不受本参数影响。
+        bandpass 为 {"f1","f2","f3","f4"}（Hz），非法或 dt 未知时抛 JobError。
+        """
+        return self._display_data(gid, bandpass, self.display_vlim(gid))
 
     @staticmethod
     def aug_image_rel(gather_id: str, clip_value: float) -> str:
@@ -105,26 +151,43 @@ class Job:
         """界面显示图缓存目录（.cache/，不入导出结果）。"""
         return os.path.join(self.output_dir, ".cache")
 
-    def display_image(self, gid: str) -> str:
-        """返回界面显示图绝对路径（.cache/<gid>.png，缺则渲染）。
+    @staticmethod
+    def _filter_suffix(bp: dict) -> str:
+        """滤波显示图的缓存后缀，如 __flt10-20-100-150（bp 已归一化）。
+
+        带后缀的缓存与干净图 <gid>.png 互不覆盖 —— 「还原」瞬间命中干净缓存，
+        也不会把干净图顶掉成滤波图。
+        """
+        return "__flt" + "-".join(f"{float(bp[k]):g}" for k in ("f1", "f2", "f3", "f4"))
+
+    def display_image(self, gid: str, bandpass: dict | None = None) -> str:
+        """返回界面显示图绝对路径（.cache/<gid>[__flt…].png，缺则渲染）。
 
         显示图只用做标注/预览（预览 clip=self.clip），绝不写入导出 images/；
         导出图只在保存时生成 N_AUG 张 <gid>__clip<值>.png，从而保证 images/
         与 labels.jsonl 记录一一对应、无孤立图。
         """
-        abs_p = os.path.join(self.cache_dir, f"{gid}.png")
+        bp = self._bandpass_params(bandpass)      # 先校验，参数不全就报错而非回落到干净图
+        suffix = "" if bp is None else self._filter_suffix(bp)
+        abs_p = os.path.join(self.cache_dir, f"{gid}{suffix}.png")
         if not os.path.isfile(abs_p):
-            self._render_png(self.display(gid), abs_p)
+            vlim = self.display_vlim(gid)
+            self._render_png(self._display_data(gid, bandpass, vlim), abs_p, vlim=vlim)
         return abs_p
 
-    def _render_png(self, data: np.ndarray, abs_path: str) -> str:
-        """原子渲染 PNG：先写同目录临时文件再 os.replace，避免并发读到半截文件。"""
+    def _render_png(self, data: np.ndarray, abs_path: str,
+                    vlim: float | None = None) -> str:
+        """原子渲染 PNG：先写同目录临时文件再 os.replace，避免并发读到半截文件。
+
+        vlim 给定则按该色标界限归一（界面显示图：滤波前后同一色标）；
+        不给则由 render_data_only 取数据自身最大值（导出增强图沿用原行为）。
+        """
         d = os.path.dirname(abs_path)
         os.makedirs(d, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=d, suffix=".png")
         os.close(fd)
         try:
-            render_data_only(data, out_path=tmp)
+            render_data_only(data, out_path=tmp, vlim=vlim)
             os.replace(tmp, abs_path)
         finally:
             if os.path.isfile(tmp):
@@ -219,10 +282,25 @@ class JobManager:
             return gs
         return [g for g in gs if g.n_traces >= limit]
 
+    @staticmethod
+    def _decimate(gs, decimate_n):
+        """抽稀：按抽取顺序等间隔删道集，每 decimate_n 个保留 1 个（留第 1、1+n… 个）。
+
+        decimate_n <= 1 或缺失 = 不抽稀。返回新列表（不改原 gs）。
+        """
+        try:
+            n = int(decimate_n or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 1:
+            return gs
+        return gs[::n]
+
     def _job_meta(self, job_id: str, title: str, path: str, endian: str,
                   sort_keys, extract_keys, values, clip: float,
                   aug_lo: float, aug_hi: float, created_by: str,
-                  output_dir: str, min_traces: int = 0) -> dict:
+                  output_dir: str, min_traces: int = 0, dt_ms: float = 0.0,
+                  decimate_n: int = 1) -> dict:
         return {"job_id": job_id, "title": title, "source_file": os.path.abspath(path),
                 "endian": endian, "sort_keys": [list(k) for k in sort_keys],
                 "extract_keys": [list(k) for k in extract_keys],
@@ -231,6 +309,9 @@ class JobManager:
                 "clip_percentile": float(clip),
                 "aug_lo": float(aug_lo), "aug_hi": float(aug_hi),
                 "min_traces": int(min_traces or 0),
+                # 采样间隔（ms）：界面「滤波」按它换算角频率；缺则滤波不可用
+                "dt_ms": float(dt_ms or 0.0),
+                "decimate_n": int(decimate_n or 1),
                 "created_by": created_by,
                 "created_at": datetime.now().isoformat(timespec="seconds"),
                 "state": "open", "output_dir": output_dir}
@@ -238,19 +319,24 @@ class JobManager:
     def create_job(self, source_file: str, sort_keys, extract_keys, values,
                    clip: float | None = None, title: str = "", created_by: str = "",
                    endian: str = "auto", min_traces: int = 0,
-                   aug_lo: float = 90.0, aug_hi: float = 99.9) -> Job:
+                   aug_lo: float = 90.0, aug_hi: float = 99.9,
+                   decimate_n: int = 1) -> Job:
         """从真实 sgy 抽道集建作业：写 job.json + 注册。
 
         values: 单字段 list[int] / 多字段 list[tuple]。
         clip: 预览 clip（仅界面显示/画框参照，默认 99）。
         aug_lo/aug_hi: 保存时随机采样的 clip 范围（每张道集存 N_AUG 张）。
         min_traces: 道数 < 该值的道集从任务池滤去（不标注）；0=不过滤。
+        decimate_n: 抽稀间隔 —— 按抽取顺序每 N 个道集保留 1 个进任务池；<=1=不抽稀。
+                    顺序为先按 min_traces 过滤、再抽稀（劣质道集先出局，抽稀只削好道集）。
+                    两个参数都写入 job.json，启动恢复时同样施加，保证池子一致。
         """
         clip = 99.0 if clip is None else clip
         if not (0 < aug_lo <= aug_hi <= 100):
             raise JobError("增强 clip 上下限须满足 0 < 下限 ≤ 上限 ≤ 100")
         r, gs = self._extract(source_file, sort_keys, extract_keys, values, endian)
         gs = self._filter_min_traces(gs, min_traces)
+        gs = self._decimate(gs, decimate_n)
         if not gs:
             limit = int(min_traces or 0)
             raise JobError(
@@ -258,13 +344,15 @@ class JobManager:
         job_id = f"{os.path.splitext(os.path.basename(source_file))[0]}__{datetime.now():%Y%m%d%H%M%S}"
         output_dir = os.path.join(self.jobs_root, job_id)
         os.makedirs(output_dir, exist_ok=True)
+        info = r.info()
         meta = self._job_meta(job_id, title, source_file, endian,
                               sort_keys, extract_keys, values, clip,
                               aug_lo, aug_hi, created_by, output_dir,
-                              min_traces=min_traces)
+                              min_traces=min_traces, dt_ms=info["dt_ms"],
+                              decimate_n=decimate_n)
         with open(os.path.join(output_dir, "job.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
-        ns = r.info()["ns"]
+        ns = info["ns"]
         job = self.register_job(meta, gs, ns, lambda g, r=r: r.get_traces(g.trace_indices))
         return job
 
@@ -300,7 +388,17 @@ class JobManager:
                     [tuple(x) for x in meta["extract_keys"]],
                     _restore_values(meta["values"]), meta.get("endian", "auto"))
                 gs = self._filter_min_traces(gs, meta.get("min_traces", 0))
-                job = self.register_job(meta, gs, r.info()["ns"],
+                gs = self._decimate(gs, meta.get("decimate_n", 1))
+                info = r.info()
+                # 旧作业（无 dt_ms）从源文件补齐采样间隔，使界面「滤波」可用；
+                # 仍取不到就保持 0（未知），届时拒绝滤波而不是按猜的 dt 画错通带
+                try:
+                    known = float(meta.get("dt_ms") or 0.0) > 0
+                except (TypeError, ValueError):
+                    known = False
+                if not known:
+                    meta["dt_ms"] = info["dt_ms"]
+                job = self.register_job(meta, gs, info["ns"],
                                         lambda g, r=r: r.get_traces(g.trace_indices))
             except Exception:
                 meta = dict(meta); meta["state"] = "broken"

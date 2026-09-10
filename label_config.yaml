@@ -13,6 +13,11 @@
 #   sentence_template: 用 {特征显示名} 引用各特征所选选项的 phrase
 #
 # 注：不设「不确定」选项（用户决策：不确定标签不利于分类任务训练）。
+# 注：v3.7 起删除「静校正」「直达波」「50Hz工业噪声」三个特征；旧 labels.jsonl 里
+#     残留的 statics/direct_wave/industrial_50hz 字段不参与校验（向后兼容），
+#     需要统一重写时跑 migrate_remove_features.py。
+# 注：v3.8 起把带框特征（面波 / 近炮点强能量噪声）排到最后 —— 界面与键盘顺序就是
+#     标签顺序，于是「先键盘一路答完选择题，再用鼠标 Ctrl 两点框选」成为自然流程。
 
 features:
   - name: 集合类型
@@ -24,30 +29,6 @@ features:
       - label: 残差
       - label: 其他
 
-  - name: 静校正
-    key: statics
-    options:
-      - label: 需要
-        phrase: 需要静校正
-      - label: 不需要
-        phrase: 不需要静校正
-
-  - name: 直达波
-    key: direct_wave
-    options:
-      - label: 存在
-      - label: 不存在
-      - label: 已压制但有残留
-
-  - name: 面波
-    key: surface_wave
-    bbox: true
-    bbox_color: "#1f6feb"          # 蓝实线
-    options:
-      - label: 存在
-      - label: 不存在
-      - label: 已压制但有残留
-
   - name: 异常振幅
     key: abnormal_amplitude
     options:
@@ -55,8 +36,19 @@ features:
       - label: 不存在
       - label: 已压制但有残留
 
-  - name: 50Hz工业噪声
-    key: industrial_50hz
+  - name: 混叠噪声
+    key: aliasing_noise
+    options:
+      - label: 存在
+      - label: 不存在
+      - label: 已压制但有残留
+
+  # —— 以下两个带矩形框，按要求排在最后（键盘答完后用鼠标 Ctrl 框选）——
+
+  - name: 面波
+    key: surface_wave
+    bbox: true
+    bbox_color: "#1f6feb"          # 蓝实线
     options:
       - label: 存在
       - label: 不存在
@@ -71,11 +63,4 @@ features:
       - label: 不存在
       - label: 已压制但有残留
 
-  - name: 混叠噪声
-    key: aliasing_noise
-    options:
-      - label: 存在
-      - label: 不存在
-      - label: 已压制但有残留
-
-sentence_template: "这是一条{集合类型}，{静校正}，直达波{直达波}，面波{面波}，异常振幅{异常振幅}，50Hz工业噪声{50Hz工业噪声}，近炮点强能量噪声{近炮点强能量噪声}，混叠噪声{混叠噪声}。"
+sentence_template: "这是一条{集合类型}，异常振幅{异常振幅}，混叠噪声{混叠噪声}，面波{面波}，近炮点强能量噪声{近炮点强能量噪声}。"

@@ -4,6 +4,334 @@
 
 ---
 
+## v3.8.6（2026-09-10）— 修复「框拖不动/缩不了」+「不存在还能拉第二个框」
+
+**用户实测**：① 拉出的框没法拖动、没法缩放 ② 面波选「存在」、近炮点选「不存在」，
+却还能给近炮点拉出第二个框（正常只该有面波一个框）。
+
+**① 根因：v3.8 重写交互时把 `preventDefault()` 丢了。**
+v3.7 的 `onDown` 对**每一次** pointerdown 都 `preventDefault + stopPropagation`；我改写成
+「Ctrl 分支先判、普通左键分支后判」时，只在 Ctrl 分支里留了这两行，普通左键路径没有 →
+在 `<img>` 上按住左键触发浏览器**原生图片拖拽**，手势被浏览器接管，
+`pointermove/pointerup` 收不到 → 框既拖不动也缩不了（拖动时还会看到图片被拖走的影子）。
+- 修法：把 `e.preventDefault(); e.stopPropagation();` 提到 `onDown` 最开头，所有路径都吃；
+  另加 CSS `-webkit-user-drag: none; user-select: none;` 与一个捕获阶段的 `dragstart`
+  拦截器（有些浏览器不看 `-webkit-user-drag`），双保险。
+
+**② 根因：`box_target` 的兜底规则没考虑「不存在」。**
+规则 3「都框好了 → 返回最后一个（便于重画）」直接返回 `feats[-1]`。面波=存在且已画框、
+近炮点=不存在时，规则 1/2 都找不到目标 → 落到规则 3 → 返回**近炮点** →
+Ctrl 两点就给一个「不存在」的特征画了框（保存时又会被 `finalize_regions` 丢掉，纯属白干）。
+- 修法：规则 3 改为「最后一个**非「不存在」**的特征」，并在都不需要框时返回 **None**；
+  前端 `targetKey === null` 时 Ctrl 直接不动作（画布提示也变成"框选已完成"）。
+  顺带让规则 1 的语义更明确（`is_absent()` 辅助函数）。
+
+**验证**：`pytest` → **124 passed**（`TestBoxTarget` 新增/改写 4 项：两个都「不存在」→ None、
+「不存在」的绝不成为目标、非「不存在」的那个仍可作重画目标）；`smoke_web.py` → **21 passed**
+（新增 `test_absent_feature_cannot_get_a_second_box`：面波=存在+已画框、近炮点=不存在时
+`/api/boxes` 的 target 必须是面波而不是近炮点；两个都「不存在」→ target 为 None）；
+`build_app()` OK。
+
+**教训**：重写交互代码时，**原有的 `preventDefault()` 属于行为的一部分**，不是可有可无的样板；
+「兜底返回最后一个」这类规则要先问一句"最后一个真的合法吗」。
+
+---
+
+## v3.8.5（2026-09-10）— 选中作业即自动领取第一张
+
+**需求（用户）**：选择作业时自动领取第一张，不需要再点「领取下一张」。
+
+**改动**（`web_app.open_job_for`）
+- 原来只 `st["job_id"]=…` + 清暂存 + `refresh_anno`（于是提示「请点领取下一张」）；
+  现在紧接着 `JM.claim(job_id, user)`，领到就直接 `show_current` 显示该张。
+- 领不到的三种情况都给出真实原因（比让用户去点按钮再看更清楚）：
+  已标完 → `🎉 本作业已全部标注（n/total）`；已关闭/已删除/全被占 → `JM.claim` 的 reason。
+- **重复选中同一作业且手上还压着一张没保存的 → 原样返回，不换张、不清 partial/boxes**，
+  避免 Gradio 偶发重触发把未保存的选择白丢掉。换作业才会清暂存（换作业丢未保存内容是既有语义）。
+- 清理时多 pop 了 `filter`（gid 绑定的滤波态，换张本就自动失效，顺手清干净）。
+- 界面引导文案 3 处 `请选择作业后点「领取下一张」` → `请选择作业（选中即自动领取第一张）`。
+- 「领取下一张」按钮保留：归还/跳过后仍要手动继续。
+
+**验证**：`pytest` → **122 passed**；`smoke_web.py` → **20 passed**（新增 5 项：
+选中即领到且提示行含道集号、重复选中不丢未保存项、换作业在新作业领到、
+已标完作业只报「全部标注」且无 gid、归还后「领取下一张」仍可用且输出长度仍合规）；
+`build_app()` OK。测试里三个作业分别用 a/b/c 三个 sgy 文件建 —— job_id 含**秒级**时间戳，
+同一文件同一秒建两个作业会撞名报「作业已存在」。
+
+---
+
+## v3.8.4（2026-09-10）— 修复 Enter 不保存（用户实测）
+
+**用户实测**：标注完成后按 Enter 没有跳到下一张。
+
+**根因：v3.8.3 自己加的"防重复"守卫把 Enter 吃掉了。**
+原来写的是「焦点已在 BUTTON/submit 上 → `return`，交给浏览器原生点击」。但实际流程是：
+标注者一开始点过「领取下一张」，**焦点就一直留在那个按钮上**，之后每次 Enter 都被这个
+守卫放行给浏览器 → 浏览器原生又点一次「领取下一张」→ 只弹「尚未保存」提示，根本没保存，
+表现成"按 Enter 没反应"。守卫想防的"重复触发"其实不存在（原生点击点的是**那个**按钮，
+不是保存按钮），反而挡住了正路。
+
+**修法**
+- Enter 分支去掉按钮守卫：只要不是**可写**输入框，一律
+  `preventDefault + stopPropagation` 后再 `clickSave()`。preventDefault 同时压掉
+  「焦点按钮被原生再点一次」的默认行为，语义变成确定的「Enter = 保存并下一张」。
+- 顺带把只读字段放行：`isTyping(t) && !t.readOnly` 才算"正在输入"。这样焦点在只读的
+  「句子预览」上时 Enter 也能保存；而在建作业表单那种可写框里仍不抢 Enter。
+  （依赖 Gradio 给非交互 Textbox 加 `readOnly`；没加则退回原行为，不会更糟。）
+- 按钮查找加兜底 `saveBtn()`：elem_id 可能落在包一层的 div 上、也可能直接落在 button 上，
+  都找不到就按文案「保存并释放」在全部 `button` 里找（文案足够独特），保证 Enter 一定点得到。
+
+**验证**：`pytest` → **122 passed**；`smoke_web.py` → **15 passed**；`build_app()` OK。
+`tests/test_anno_js.py` 补了针对性回归：
+- **焦点停在 BUTTON / submit 上时 Enter 仍必须保存，且必须 preventDefault**
+  （即上述 bug 的回归锁；留着旧守卫这条必然失败）；
+- 可写 TEXTAREA / text input 里 Enter 不保存；只读 TEXTAREA 里 Enter 保存；
+- 非 Enter 键不触发保存；
+- `clickSave` 主路径（#btn-save → 内层 button）与兜底路径（id 找不到时按文案找，
+  并断言点到的是「保存并释放」那个而不是旁边无关按钮）。
+
+**教训**：给键盘快捷键加"防重复"守卫前，先确认默认行为到底会触发什么 ——
+这里的默认行为是"再点一次焦点按钮"，而不是"重复触发我要点的那个按钮"。
+
+---
+
+## v3.8.3（2026-09-10）— 「不存在」跳过拉框步骤 + Enter 保存 + 滤波初值补记
+
+**需求（用户）**：① 面波选「不存在」→ 第 6 步「面波拉框」直接跳过；近炮点强能量同理
+② 「保存并释放」不用鼠标，按 Enter 也行 ③ 按钮上加提示「（按 Enter 下一张）」。
+
+**① 跳过逻辑（前端，与服务端同一规则）**
+- `_ANNO_FEATS` 由 `[key, name]` 扩成 `[key, name, 该特征「不存在」选项的 label]`
+  （`_absent_label()`；没有该选项的特征给 `""`，永远不会被跳过）。
+- JS 新增 `checkedLabel()`（**去掉选项的快捷键前缀**再比较 —— 界面文本是 "2 不存在"，
+  而配置里的 label 是 "不存在"，不剥前缀永远比不中，这个坑当场踩到）、
+  `needsBox(feat)`、`skippable(item)`、`nextIndex(items, from, dir)`。
+- `handleDigit` 与 `moveCursor` 都改走 `nextIndex`：答完一题后自动跳过「不需要框」的
+  拉框项；**前方全是可跳过的就原地不动**（避免光标停在一步被跳过的项上）。
+  必须先落选项再算下一题，否则选「不存在」后算出的下一题还是该项。
+- 视觉：`paintCursor()` 给被跳过的拉框项加 `.anno-skip`（`opacity:.42` 置灰），
+  改回「存在」即恢复正常。
+- 服务端 `box_statuses_of` 同步：该特征选了「不存在」时状态行写
+  「已选「不存在」，无需画框（本步自动跳过）」，且不再标成 Ctrl 目标。
+
+**② Enter 保存**
+- 保存按钮加 `elem_id="btn-save"`，标签改为「保存并释放（按 Enter 下一张）」。
+- JS 把键盘逻辑抽成具名 `onKeydown(e)`（便于无浏览器测试），`Enter` → `clickSave()`
+  （`#btn-save` 里层的 `<button>`）→ `preventDefault + stopPropagation`。
+- 两个防重复/误触保护：焦点已在 `BUTTON`/`button`/`submit` 上时交回浏览器原生点击，
+  不重复触发；`isTyping(e.target)` 保证在文本框/数字框里按 Enter 不会保存。
+
+**验证**：`pytest` → **122 passed**；`smoke_web.py` → **15 passed**（新增「不存在 → 状态行
+说无需画框且 Ctrl 目标顺延」）；`tests/test_anno_js.py` 扩展覆盖：选「不存在」后
+`skippable` 为真、答完自动越过该拉框项、两个框都可跳过时光标原地不动且两项都置灰、
+改回「存在」后恢复并能进入该拉框项、Enter 触发保存一次、焦点在按钮/提交控件/文本框时
+不重复触发、非 Enter 键不触发。`build_app()` 实测确认按钮标签与 `btn-save` id、`.anno-skip` 样式。
+
+**遗留**：`_absent_label()` 认的是 web_core.ABSENT_LABEL（"不存在"）；若以后给拉框特征改用
+别的「不需要框」措辞，前后端两处规则要一起改。仍需浏览器实测。
+
+---
+
+## v3.8.2（2026-09-10）— 修复方向键「同题内跳选项」+ 滤波初始值
+
+**用户实测反馈**：① `↑`/`↓` 跳转不对 —— 变成在**同一个问题内的不同选项**之间跳，
+希望是上一题/下一题 ② 滤波初始参数改成 8 / 9 / 120 / 121。
+
+**① 根因：JS 按 radio 的 `name` 属性分组，而 Gradio 6 的 radio 输入没有 `name`**
+- v3.8.1 的 `radioGroups()` 写成 `inputs[i].name || ('__g' + i)`：一旦 `name` 为空，
+  **每个选项都被当成独立一题**（`__g0/__g1/...`），于是 `items()` = 16 个选项项 + 2 个拉框项，
+  `↑`/`↓` 就在选项之间逐格移动 —— 与用户描述完全一致。
+  数字键 `1` 之所以"看起来对了"，是因为第 1 个选项恰好叫「1 炮集」，纯属巧合。
+- 修法：**不再猜 DOM 属性**，改为确定性定位 —— `build_app` 给每道选择题包一层
+  `gr.Column(elem_id=f"q-{feat.key}")`，JS 侧注入 `_ANNO_FEATS`（全部特征的 key+名，
+  顺序=题号顺序），`items()` = 按 `_ANNO_FEATS` 顺序取 `#q-<key>` 里的 radios + 按
+  `_DRAG_BBOX` 顺序取 `#bx-<key>`。题项自带高亮元素 `el`，`itemEl()` 直接返回，
+  连"向上找共同祖先"的启发式也一并删掉。
+- 方向键另外加固：捕获阶段对 `↑↓←→` 一律 `preventDefault + stopPropagation`。
+  焦点落在 radio 上时，浏览器默认行为就是"同组内换选项"，这正是那个症状的另一条来源；
+  现在四个方向键都被吃掉，只用来移动题目光标（`←`/`→` 不做事但也不再改选项）。
+- 回归测试：`tests/test_anno_js.py` 的 DOM 桩**故意把 radio 的 `name` 留空**（模拟 Gradio 6），
+  断言 `items().length === 7`、第 1 题是 4 个选项的一组、方向键移动后
+  **所有选项的选中态不变**、高亮整题移动。旧实现在这个桩下会得到 18 项，必然失败。
+
+**② 滤波初始值 10/20/100/150 → 8/9/120/121**（仅界面 Number 默认值；
+`preprocess` 注册表里那份默认仍保留 SeiSee 原值 10/20/100/150，供程序化调用兜底。）
+实测 `build_app()` 的 config 确认 f1=8 f2=9 f3=120 f4=121。
+
+**验证**：`pytest` → **122 passed**；`smoke_web.py` → **14 passed**；`build_app()` 可构建；
+`node --check` 通过；另用脚本核对生成的 config：`q-`/`bx-` elem_id 齐全、
+Radio 标签 1..5 与拉框项 6/7 顺序正确、滤波四值确为 8/9/120/121。
+**遗留**：仍需浏览器实测（方向键的观感、高亮是否整题生效）。
+
+---
+
+## v3.8.1（2026-09-10）— 标注交互三处修正（用户实测反馈）
+
+**用户实测反馈**：① 数字键填了第 1 题但没自动跳下一题，希望答完自动跳、当前题**高亮**、
+`↑` 能回上一题 ② 题序要固定成 7 项：1 集合类型 / 2 异常振幅 / 3 混叠噪声 / 4 面波 /
+5 近炮点强能量 / **6 面波拉框 / 7 近炮点强能量拉框**（拉框项从各题内联挪到所有选择题之后）
+③ 「✕ 清除此框」第一下不生效、要点第二次。
+
+**① 显式光标 + 高亮**（根因：v3.8 用的是「第一个未答题」这种**无位置**的隐式目标，
+用户看不到"当前在哪"，也没有回退能力）
+- JS 改为显式 `cursor` 序号，覆盖 **7 个题项**（5 选择题 + 2 拉框项，由 `items()` 按
+  DOM 顺序收集：先 `input[type=radio]` 分组、再 `[id^="bx-"]` 拉框块）。
+- `paintCursor()` 给当前题项（radio 组容器 / 拉框块）加 `.anno-current` → 蓝色外框 + 浅底 +
+  字重加粗，并 `scrollIntoView({block:'nearest'})`。CSS 加在 ANNO_JS 的 `<style>` 里。
+- `handleDigit(d)`：只答**光标所在题**，答完 `cursor++` 自动前移；拉框项不吃数字键。
+- `moveCursor(±1)`：`↑` 上一题 / `↓` 下一题，越界夹住。鼠标点选某题也会把光标移过去。
+- 换道集（`place()` 的换图分支）时 `cursor = firstUnansweredIndex()` —— 新道集回到第 1 题，
+  中途滤波换图则落在第一道未答题上。
+- `place()` 每次都会 `paintCursor()`，靠已有的 MutationObserver + 900ms 兜底轮询在 Gradio
+  重渲染后恢复高亮。
+- **教训**：隐式目标（"第一个未答题"）在只有键盘、没有可见光标时不好用 —— 用户需要
+  "我在哪 + 能退回去"。
+
+**② 题序固定 1..7**
+- 标注区右栏由「两列 3+2」改为**单列**：先 `for i, feat in enumerate(feats)` 渲染 5 道选择题
+  （标签 `f"{i+1}. {name}"`），再 `for bi, feat in enumerate(bbox_feats())` 渲染拉框项，
+  每项一个 `gr.Column(elem_id=f"bx-{feat.key}")` + 标题 `f"**{len(feats)+bi+1}. {name} 拉框**"`
+  + 「✕ 清除此框」+ 状态行；`filter_panel` 挪到面波那个拉框项里（同属面波标注区）。
+- 删掉不再用的 `half = (len(feats)+1)//2` 与两列渲染。
+- 实测 `build_app()` 的 config 确认顺序为 1.集合类型 2.异常振幅 3.混叠噪声 4.面波
+  5.近炮点强能量噪声 + 6.面波拉框 7.近炮点强能量噪声拉框，`bx-`/`cb-`/`fb-`/`filter_panel`
+  的 elem_id 齐全。
+
+**③ 清除框第一下不生效**（v3.8 自己引入的 bug）
+- 根因：v3.8 在 `clearKey()` 里加了 `fetchBoxes()`，但**服务端要等本次 Gradio 事件跑完**
+  才把 `st["boxes"][key]` 置空；立刻回填把旧框又拉了回来 → 表现成点两次才清。
+- 修法：`clearKey()` 只做本地 `delete boxes[key]`（点一下即消失）+ redraw，**不再立刻
+  fetchBoxes**；服务端返回的新图会换 src（有无 overlay 的路径不同），`place()` 的换图分支
+  届时自然会重新拉一次，那时已是清空状态。
+
+**验证**：`pytest` → **122 passed**；`smoke_web.py` → **14 passed**；
+`tests/test_anno_js.py` 的 Node 断言扩到覆盖光标模型：7 个题项且拉框项在最后、初始高亮在
+第 1 题、答完自动跳到第 2 题且高亮跟着走、无对应数字不动作也不移动光标、拉框项不吃数字键、
+`↑`/`↓` 越界夹住、回到第 1 题重答覆盖原选择；另加 `test_script_has_no_stale_box_mode_hooks`
+防止旧框选代码残留（`pickByDigit`/`firstUnanswered`/`drawKey` 均已清除，grep 无残留）。
+**遗留**：仍需浏览器人工实测（高亮样式在 Gradio 6.26 实际 DOM 上的观感、
+`document.activeElement` 对高亮无干扰、Ctrl 两点手感）。
+
+---
+
+## v3.8（2026-09-10）— 标注交互重构：键盘答题 + Ctrl 两点框选 + 滤波单键开关
+
+**需求（用户，5 条）**：① 滤波前后显示范围统一（用滤波前的），便于对比 ② 滤波参数按
+标注者+作业记忆、每张需重新点、删「还原」按钮、改成点一次应用再点一次还原
+③ 进入标注后键盘 1/2/3 直接选项并自动跳下一题 ④ 拉框改 Ctrl 启动 + 两点定矩形（仍可
+拖动缩放微调）⑤ 两个带框特征统一放到题目最后（先键盘答完，再鼠标框）。
+
+**① 显示范围统一**（`preprocess.clip_bound` / `clip_abs` + `Job.display_vlim`）
+- 原来 `display()` 对**滤波后**数据算 clip 分位数 → 色标跟着数据变，等于重新拉满对比度，
+  看不出滤波到底压掉多少。改为色标界限**只从原始数据算一次**，滤波前后共用
+  `clip_abs` 截断；`_render_png` 新增 `vlim` 参数让 PNG 归一也用同一界限。
+- 效果（实测合成道集）：vlim=3.09，clean 达满量程、filt 只到 0.83 → 滤波图明显变淡，
+  是为可对比的诚实显示。导出增强图仍走 `render_data_only(vlim=None)`（各自随机 clip），不变。
+- **画布与数据两级都要统一**：`render_data_only` 本来会按 `data.max()` 重新归一，
+  只改 `display()` 不改渲染等于白改——这点是写测试时才发现的关键。
+
+**② 滤波单键开关 + 参数按作业记忆**
+- 删掉「应用滤波」「还原」两个按钮，以及 v3.7 的展开/收起面板（`toggle_filter` 折叠版），
+  只留一个「⚙ 滤波（点一次应用，再点一次还原）」；面板常驻显示。
+- `st["filter_params"][job_id]` 按 (标注者, 作业) 记忆参数；`_filter_fields(user)` 把这套
+  参数回填到 4 个输入框，并作为 `anno_outputs` 尾部的输出——这就是「一个作业内参数统一」
+  的可见保证。应用状态仍绑 gid → 换张必须重新点，不会默认生效。
+- **踩坑**：把 4 个参数字段并入 `anno_outputs` 后，`_filter_outputs` 必须返回**全长度**
+  （img+info+sentence+radios+box_statuses+4），否则点击即崩。已补
+  `SmokeAnnoOutputArity` 把每个 handler 的返回长度与契约对一遍。
+
+**③ 键盘答题**（ANNO_JS）
+- 全局 keydown：数字键（含小键盘）→ 目标 = **第一个未答题**的 radio 组 → 匹配选项文本
+  开头的数字 → `.click()` 走 Gradio 原生路径（句子预览照常刷新）；答完自动前移，
+  全答完后数字键失效（防误改）。
+- 安全约束：`isTyping()` 判定焦点在文本/数字输入框、textarea、select、contenteditable 时
+  不拦截（建作业表单、句子框照常输入）；radio/checkbox/button 放行。
+
+**④ Ctrl 两点框选**（ANNO_JS 重写交互）
+- 删掉 `drawKey`/`setDraw`/「▣ 框选」按钮与整套 `box_mode`/`pending_corner` 服务端状态
+  （`enter_box_mode`、`_box_enter` 一并删除）。
+- `Ctrl/⌘`（或 Mac Cmd）+左键：第一次点记下第一角（画十字 + 虚线橡皮筋预览 + 提示
+  「再 Ctrl+左键点第二角」），第二次点成框 → `rectFrom()` 归一化/取整/夹到 512×1024 →
+  校验 MIN 边长 → POST `/api/anno_box` → 重新拉 `/api/boxes` 顺延目标。
+- **普通左键仍可拖动/拖角缩放微调**（v3.6.1 的 move/resize 逻辑原样保留），松手同样提交。
+- **目标特征由服务端定**（`web_core.box_target`）：第一个「已选且非不存在、但还没框」的
+  bbox 特征；没作答的次之；都框好了回最后一个便于重画。`/api/boxes` 现在返回
+  `{boxes, target}`，前端不去猜 DOM 里的选项状态——规则留在 Python 侧，可单测（10 项）。
+- 选项变化（radio change）时前端重新拉 `/api/boxes`，选了「不存在」目标会自动顺延。
+
+**⑤ 标签顺序**（label_config.yaml）
+- 顺序改为 集合类型 → 异常振幅 → 混叠噪声 → **面波 → 近炮点强能量噪声**，句子模板同步。
+  左栏 3 道纯选择题、右栏 2 道带框题：DOM 顺序 = 键盘顺序 = 先选择题后框选。
+- 测试补 `test_bbox_features_are_last` 把「带框特征必须连续排在末尾」钉住。
+
+**验证**：`python -m pytest tests/ -q` → **122 passed**（v3.7 为 98；新增
+`test_anno_js.py` 2 项、`box_target` 10 项、`clip_bound/clip_abs` 7 项、共享色标 4 项、
+`test_labels` 顺序 1 项等）；`python tests/smoke_web.py` → **14 passed**。
+另做目视验证：合成「8 Hz 面波 + 55 Hz 反射」道集，滤波后图变淡而非被重新拉满。
+**新增 `tests/test_anno_js.py`**：用 Node + 最小 DOM 桩加载 ANNO_JS，直接断言
+`pickByDigit`（按键选题/自动前移/答完失效）、`isTyping`（输入框不拦截）、`rectFrom`
+（两点归一化与夹紧）。**注意**：抽取 ANNO_JS 必须 `ast.literal_eval` 解一层转义——
+文件里写的是 `\\d`，直接拿原文当 JS 会变成「匹配反斜杠+d」，数字键永远失效（本测试踩过）。
+另加 `test_script_has_no_stale_box_mode_hooks` 防止旧框选模式代码残留。
+
+**遗留**：浏览器端仍需人工实测（Ctrl 两点手感、橡皮筋、拖动微调、数字键与 Gradio 的实际
+事件联动）；滤波参数不跨作业继承（按需求就是「一个作业内统一」）；带框特征的
+`bbox_color` 与新增的「清除」按钮布局未变。
+
+---
+
+## v3.7（2026-09-10）— 精简标签体系 + 面波区按需滤波 + 建作业抽稀
+
+**需求（用户）**：① 去掉「静校正」② 去掉「直达波」③ 去掉「50Hz工业噪声」
+④ 面波标注区加「滤波」按钮：设范围→应用后显示图变滤波后数据（用 bandpass.py 算法）
+⑤ 管理员建作业增加抽稀：按原始顺序等间隔删道集再入池，比例可设。
+
+**①–③ 标签精简**（`label_config.yaml`，纯配置改动，界面自动跟随）
+- 特征从 8 项降到 5 项：集合类型 / 面波 / 异常振幅 / 近炮点强能量噪声 / 混叠噪声；
+  句子模板同步重写（`这是一条{集合类型}，面波{面波}，…`）。
+- 向后兼容：`validate_selection` 只遍历配置内特征，旧 `labels.jsonl` 里残留的
+  `statics`/`direct_wave`/`industrial_50hz` 字段不参与校验、照常读取；要统一重写跑
+  `migrate_remove_features.py`。测试里的通用 helper 本就是按 `CFG.features` 生成，未受影响。
+
+**④ 面波区「⚙ 滤波」**（显示辅助，不碰训练数据）
+- `preprocess.py` 按既有注册表模式新增 `bandpass` 步骤，逐道复用 `bandpass.py` 的
+  `bandpass_seisee`（SeiSee 四角频率零相位 FFT 余弦过渡）。参数 f1<f2<f3<f4 非法、
+  dt≤0 一律 `ValueError`，不静默返回原图。`np.asarray(..., float64)` 必得副本 →
+  不就地改写调用方数据（干净视图不被污染，有测试守着）。
+- **顺序：先滤波再 clip**，显示对比度一致。
+- **状态与 gid 绑定**（`web_core.active_filter`）：`st["filter"]={"gid":…,f1..f4}`，
+  `render_display` 仅在该 gid 匹配时生效 → 换道集自动还原，无需在 claim/skip/reopen
+  各 handler 补清除逻辑，「忘了关掉滤波」不会发生。
+- **缓存键分离**：滤波图存 `.cache/<gid>__flt10-20-100-150.png`，干净图 `.cache/<gid>.png`
+  不被顶掉，「还原」命中干净缓存瞬时返回。
+- 采样间隔 `dt` 走 `job.json` 新增的 `dt_ms`（create_job 写入；load_all 对旧作业从
+  reader 补齐）。**取不到 dt 时拒绝滤波并提示**，绝不按猜的 dt 画错通带位置。
+- 导出不受影响：`JobManager.save` 渲染增强图走 `job.raw()`（非 `display()`），
+  滤波只改「看」——有测试断言导出图路径不含 `__flt`。
+- 前端联动：换图会让 ANNO_JS 的 `lastSrc` 分支重置本地框选态（框会从 `/api/boxes`
+  重新拉回，不丢），故「应用/还原」同时清服务端 `box_mode`，避免提示说「框选中」
+  而实际拖不出框。
+- 实现中发现并修复：`_filter_outputs` 无当前道集时不能调 `box_statuses_of`
+  （它会 `st["job_id"]` KeyError），改为返回占位状态（smoke 测试抓到）。
+
+**⑤ 建作业抽稀**（admin）
+- `JobManager._decimate(gs, n)` = `gs[::n]`：每 N 个留 1 个（N=2 → 留第 1/3/5…），
+  N≤1/缺省不抽稀。**执行顺序：先按 min_traces 过滤、再抽稀**——劣质道集先出局，
+  抽稀只削好道集（有测试用 [2,8,8,8] 道数序列把两种顺序区分开）。
+- `decimate_n` 写进 `job.json`，`load_all` 同样施加 → 重启后任务池与建作业时一致。
+- 旧作业无该字段默认 1（不抽稀），不必标 broken。
+- 界面提示改为只报实际生效的设置（先滤后抽无法把「少了多少」归给某一个，故不报 dropped 数）。
+
+**验证**：`python -m pytest tests/ -q` → **97 passed**（原 48，新增 test_labels 10 项、
+test_preprocess 12 项、test_jobmanager 抽稀/滤波/dt_ms 若干、test_web_core 滤波状态 12 项）；
+`python tests/smoke_web.py` → **11 passed**（含 7 项滤波 handler 冒烟）；
+`build_app()` 可构建。另做目视验证：合成「8 Hz 面波 + 55 Hz 反射」道集，高通
+30/40/80/100 后低频面波被压掉、中频反射显出（std 2.113 → 0.138）。
+**遗留**：滤波参数目前不记忆（每次重新填默认 10/20/100/150）；只挂在 `surface_wave`
+（`web_app.FILTER_FEAT_KEY`），改 key 需同步；未做浏览器端实测（框选与滤波交替操作）。
+
+---
+
 ## v3.6.2（2026-09-09）— 修复框编辑器两个前端 bug
 
 **用户实测（v3.6.1 后）**：

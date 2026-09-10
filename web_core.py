@@ -41,6 +41,79 @@ def pixel_box_to_data(c0, c1, n_tr: int, ns: int) -> dict:
     return box
 
 
+def parse_filter(f1, f2, f3, f4) -> tuple[dict | None, str]:
+    """校验面波区「滤波」的四角频率，返回 (params, err)。
+
+    合法：params = {"f1","f2","f3","f4"}（float，Hz）、err = ""；
+    非法：params = None、err 为中文提示。界面角频率一律按 Hz 输入，
+    实际通带由 jobmanager 用 job.json 的 dt_ms 换算到 FFT 频点。
+    """
+    try:
+        vals = [float(v) for v in (f1, f2, f3, f4)]
+    except (TypeError, ValueError):
+        return None, "滤波参数须为数字（四个角频率，单位 Hz）"
+    if not all(math.isfinite(v) for v in vals):
+        return None, "滤波参数须为有限数值"
+    a, b, c, d = vals
+    if not (0.0 <= a < b < c < d):
+        return None, (f"滤波角频率须满足 0 ≤ f1 < f2 < f3 < f4，"
+                      f"当前 {a:g} / {b:g} / {c:g} / {d:g} Hz")
+    return {"f1": a, "f2": b, "f3": c, "f4": d}, ""
+
+
+def active_filter(st: dict, gid: str) -> dict | None:
+    """本会话对该道集生效的滤波参数；无 / 非本道集 / 结构异常一律返回 None。
+
+    状态与 gid 绑定，换到别的道集即自动失效 —— 无需在领取/跳过/重开等每个
+    handler 里手动清除，也就不会出现「忘了还开着滤波」而按滤波图下标注。
+    """
+    f = st.get("filter")
+    if not isinstance(f, dict) or f.get("gid") != gid:
+        return None
+    params = {k: f.get(k) for k in ("f1", "f2", "f3", "f4")}
+    if any(not isinstance(v, (int, float)) for v in params.values()):
+        return None
+    return params
+
+
+ABSENT_LABEL = "不存在"
+
+
+def box_target(feats, selection: dict, boxes: dict) -> str | None:
+    """Ctrl+左键「两点定矩形」当前作用的 bbox 特征 key；当前不该画框时返回 None。
+
+    规则（依次）：
+      1. 已选且非「不存在」、但还没框的 → 第一个（正常流程：答完题按顺序框）；
+      2. 尚未作答、也还没框的 → 第一个（允许先框后选）；
+      3. 都框好了 → 最后一个**非「不存在」**的（Ctrl 再点即重画它，便于微调）；
+      4. 一个都不需要框（例如两个都选了「不存在」）→ **None**，Ctrl 不再画出多余的框。
+    选「不存在」的特征在第 1 步就被跳过，也不会在第 3 步被当成重画目标。
+    """
+    feats = list(feats or [])
+    if not feats:
+        return None
+    sel = selection or {}
+    bx = boxes or {}
+
+    def has(k: str) -> bool:
+        return bool(bx.get(k))
+
+    def is_absent(f) -> bool:
+        return sel.get(f.name) == ABSENT_LABEL
+
+    for f in feats:
+        lab = sel.get(f.name)
+        if lab and not is_absent(f) and not has(f.key):
+            return f.key
+    for f in feats:
+        if not sel.get(f.name) and not has(f.key):
+            return f.key
+    for f in reversed(feats):
+        if not is_absent(f):
+            return f.key
+    return None
+
+
 _STATE_CN = {"open": "进行中", "closed": "已关闭", "broken": "异常"}
 
 

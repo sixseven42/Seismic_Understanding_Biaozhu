@@ -8,6 +8,7 @@ from segy_factory import write_sgy, _bin_header, HDR
 from gather import Gather
 from labels import LabelConfig
 from jobmanager import open_job, JobManager, JobError, finalize_regions
+from preprocess import clip_bound
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CFG = LabelConfig(os.path.join(ROOT, "label_config.yaml"))
@@ -16,7 +17,7 @@ def meta_for(job_id, out, aug=True):
     """默认带新版增强字段（aug_lo/aug_hi）；aug=False 模拟旧版作业（需重建）。"""
     m = {"job_id": job_id, "title": "测试", "source_file": "x.sgy", "endian": "auto",
          "sort_keys": [[95, 96]], "extract_keys": [[95, 96]], "values": [1, 2, 3],
-         "clip_percentile": 99.0, "created_by": "boss",
+         "clip_percentile": 99.0, "dt_ms": 2.0, "created_by": "boss",
          "created_at": "2026-01-01T00:00:00", "state": "open", "output_dir": out}
     if aug:
         m.update({"aug_lo": 90.0, "aug_hi": 99.9})
@@ -526,6 +527,247 @@ class TestCreateMinTraces(unittest.TestCase):
         kept = _J._filter_min_traces(gs, 5)
         self.assertEqual([g.n_traces for g in kept], [8, 12])   # 4、3 被滤
         self.assertEqual(len(_J._filter_min_traces(gs, 0)), 4)  # 0=不过滤
+
+
+class TestDecimate(unittest.TestCase):
+    """建作业「抽稀间隔 N」：按抽取顺序每 N 个保留 1 个，再进任务池。"""
+
+    @staticmethod
+    def _write_even_sgy(path, n_gathers=6, traces_per=8, ns=64):
+        write_sgy(path, n_gathers=n_gathers, traces_per=traces_per, ns=ns)
+
+    def test_decimate_unit(self):
+        from jobmanager import JobManager as _J
+        gs = [Gather(key="95-96", value=k, trace_indices=np.arange(8)) for k in range(6)]
+        self.assertEqual([g.value for g in _J._decimate(gs, 2)], [0, 2, 4])
+        self.assertEqual([g.value for g in _J._decimate(gs, 3)], [0, 3])
+        self.assertEqual(len(_J._decimate(gs, 1)), 6)      # 1 = 不抽稀
+        self.assertEqual(len(_J._decimate(gs, 0)), 6)      # 0 = 不抽稀
+        self.assertEqual(len(_J._decimate(gs, None)), 6)   # 缺省 = 不抽稀
+
+    def test_create_job_decimates_and_persists(self):
+        root = tempfile.mkdtemp()
+        sgy = os.path.join(root, "demo.sgy")
+        self._write_even_sgy(sgy, n_gathers=6)
+        jobs_root = os.path.join(root, "jobs")
+        m = JobManager(jobs_root, CFG)
+        job = m.create_job(sgy, [(95, 96), (13, 16)], [(95, 96)], [1, 2, 3, 4, 5, 6],
+                           clip=99, title="d", created_by="boss", decimate_n=2)
+        ids = job.gather_ids()
+        self.assertEqual(len(ids), 3)                      # 6 → 留第 1/3/5 个
+        self.assertTrue(ids[0].endswith("_95-96_1"))
+        self.assertTrue(ids[1].endswith("_95-96_3"))
+        self.assertTrue(ids[2].endswith("_95-96_5"))
+        self.assertEqual(job.meta["decimate_n"], 2)
+        # 重启恢复后池子必须与建作业时一致
+        m2 = JobManager(jobs_root, CFG)
+        m2.load_all()
+        self.assertEqual(m2.list_jobs()[0]["total"], 3)
+        self.assertEqual(sorted(m2.get(job.job_id).gather_ids()), sorted(ids))
+
+    def test_create_job_decimate_one_keeps_all(self):
+        root = tempfile.mkdtemp()
+        sgy = os.path.join(root, "demo.sgy")
+        self._write_even_sgy(sgy, n_gathers=6)
+        m = JobManager(os.path.join(root, "jobs"), CFG)
+        job = m.create_job(sgy, [(95, 96), (13, 16)], [(95, 96)], [1, 2, 3, 4, 5, 6],
+                           clip=99, created_by="boss", decimate_n=1)
+        self.assertEqual(len(job.gather_ids()), 6)
+
+    def test_create_job_decimate_more_than_pool_keeps_first(self):
+        root = tempfile.mkdtemp()
+        sgy = os.path.join(root, "demo.sgy")
+        self._write_even_sgy(sgy, n_gathers=6)
+        m = JobManager(os.path.join(root, "jobs"), CFG)
+        job = m.create_job(sgy, [(95, 96), (13, 16)], [(95, 96)], [1, 2, 3, 4, 5, 6],
+                           clip=99, created_by="boss", decimate_n=50)
+        self.assertEqual(len(job.gather_ids()), 1)          # gs[::50] 仍留第 1 个
+
+    def test_min_traces_filtered_before_decimate(self):
+        """顺序必须「先按道数下限过滤、再抽稀」：劣质道集先出局，抽稀只削好道集。"""
+        root = tempfile.mkdtemp()
+        sgy = os.path.join(root, "v.sgy")
+        # 炮1=2道（劣质），炮2/3/4=8道
+        TestCreateMinTraces._write_var_sgy(sgy, [2, 8, 8, 8])
+        m = JobManager(os.path.join(root, "jobs"), CFG)
+        job = m.create_job(sgy, [(95, 96), (13, 16)], [(95, 96)], [1, 2, 3, 4],
+                           clip=99, created_by="boss", min_traces=5, decimate_n=2)
+        ids = job.gather_ids()
+        # 先滤掉炮1 → [炮2,炮3,炮4]，再每 2 个留 1 个 → [炮2,炮4]
+        self.assertEqual(len(ids), 2)
+        self.assertTrue(ids[0].endswith("_95-96_2"))
+        self.assertTrue(ids[1].endswith("_95-96_4"))
+
+    def test_decimate_all_removed_raises(self):
+        """抽稀后一个不剩（理论上不可达）也要给明确报错而非空作业。"""
+        from jobmanager import JobManager as _J
+        # 空池抽稀仍为空，create_job 的「没有抽到任何道集」分支覆盖该情形
+        self.assertEqual(_J._decimate([], 3), [])
+        root = tempfile.mkdtemp()
+        sgy = os.path.join(root, "v.sgy")
+        TestCreateMinTraces._write_var_sgy(sgy, [2, 8])
+        m = JobManager(os.path.join(root, "jobs"), CFG)
+        with self.assertRaises(JobError):
+            m.create_job(sgy, [(95, 96), (13, 16)], [(95, 96)], [1, 2],
+                         clip=99, created_by="boss", min_traces=50, decimate_n=2)
+
+
+class TestBandpassDisplay(unittest.TestCase):
+    """显示图滤波：仅影响 Job.display/display_image，绝不碰导出用的 raw。"""
+
+    FLT = {"f1": 20.0, "f2": 30.0, "f3": 80.0, "f4": 100.0}
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.manager = JobManager(self.root, CFG)
+        self.out = os.path.join(self.root, "job1"); os.makedirs(self.out)
+        self.job = self.manager.register_job(meta_for("job1", self.out),
+                                             fake_gathers(), 200, fake_provider())
+        self.gid = self.job.gather_ids()[0]
+
+    def test_dt_ms_read_from_meta(self):
+        self.assertAlmostEqual(self.job.dt_ms, 2.0)
+
+    def test_unknown_dt_ms_refuses_to_filter(self):
+        """dt_ms 缺失时宁可不给滤波，也不能按猜的采样间隔画错通带位置。"""
+        m = meta_for("j2", self.out); m.pop("dt_ms")
+        job = self.manager.register_job(m, fake_gathers(), 200, fake_provider())
+        self.assertEqual(job.dt_ms, 0.0)                    # 0 = 未知
+        self.assertEqual(job.display(job.gather_ids()[0]).shape, (40, 200))   # 干净图照常
+        with self.assertRaises(JobError):
+            job.display(job.gather_ids()[0], bandpass=self.FLT)
+
+    def test_garbage_dt_ms_treated_as_unknown(self):
+        m = meta_for("j3", self.out); m["dt_ms"] = "abc"
+        job = self.manager.register_job(m, fake_gathers(), 200, fake_provider())
+        self.assertEqual(job.dt_ms, 0.0)
+        m2 = meta_for("j4", self.out); m2["dt_ms"] = -1.0
+        job2 = self.manager.register_job(m2, fake_gathers(), 200, fake_provider())
+        self.assertEqual(job2.dt_ms, 0.0)
+
+    def test_filtered_display_differs_from_clean(self):
+        clean = self.job.display(self.gid)
+        filt = self.job.display(self.gid, bandpass=self.FLT)
+        self.assertEqual(filt.shape, clean.shape)
+        self.assertFalse(np.allclose(clean, filt))
+
+    def test_filtered_display_does_not_mutate_raw(self):
+        """滤波不得就地改写 provider 的数据（否则干净视图被污染）。"""
+        before = self.job.display(self.gid)
+        self.job.display(self.gid, bandpass=self.FLT)
+        after = self.job.display(self.gid)
+        np.testing.assert_allclose(before, after)
+
+    def test_filtered_image_uses_separate_cache_file(self):
+        clean = self.job.display_image(self.gid)
+        filt = self.job.display_image(self.gid, bandpass=self.FLT)
+        self.assertNotEqual(clean, filt)
+        self.assertTrue(os.path.isfile(clean))
+        self.assertTrue(os.path.isfile(filt))
+        # 还原（再取干净图）必须仍命中干净缓存、不被滤波图顶掉
+        self.assertEqual(self.job.display_image(self.gid), clean)
+
+    def test_same_filter_reuses_cache(self):
+        a = self.job.display_image(self.gid, bandpass=self.FLT)
+        b = self.job.display_image(self.gid, bandpass=dict(self.FLT))
+        self.assertEqual(a, b)
+
+    def test_incomplete_filter_raises_instead_of_clean_fallback(self):
+        """参数不全必须报错，绝不能悄悄给回未滤波的图（点了滤波却看到干净图）。"""
+        self.job.display_image(self.gid)                  # 先建好干净图缓存
+        with self.assertRaises(JobError):
+            self.job.display_image(self.gid, bandpass={"f1": 10.0})
+        with self.assertRaises(JobError):
+            self.job.display(self.gid, bandpass={"f1": 10.0, "f2": 20.0})
+
+
+class TestDtMsPersistedOnCreate(unittest.TestCase):
+    def test_create_job_writes_dt_ms_to_job_json(self):
+        root = tempfile.mkdtemp()
+        sgy = os.path.join(root, "demo.sgy")
+        write_sgy(sgy, n_gathers=2, traces_per=8, ns=64)   # dt_us=2000 → 2.0 ms
+        jobs_root = os.path.join(root, "jobs")
+        m = JobManager(jobs_root, CFG)
+        job = m.create_job(sgy, [(95, 96), (13, 16)], [(95, 96)], [1, 2],
+                           clip=99, created_by="boss")
+        self.assertAlmostEqual(float(job.meta["dt_ms"]), 2.0)
+        m2 = JobManager(jobs_root, CFG)
+        m2.load_all()
+        self.assertAlmostEqual(m2.get(job.job_id).dt_ms, 2.0)   # 恢复后仍可用于滤波
+
+    def test_legacy_job_without_dt_ms_still_loads(self):
+        """旧作业（job.json 无 dt_ms）必须照常恢复，并补出可用采样间隔。"""
+        root = tempfile.mkdtemp()
+        sgy = os.path.join(root, "demo.sgy")
+        write_sgy(sgy, n_gathers=2, traces_per=8, ns=64)
+        jobs_root = os.path.join(root, "jobs")
+        out = os.path.join(jobs_root, "legacy__x"); os.makedirs(out)
+        meta = meta_for("legacy__x", out)
+        meta.update({"source_file": sgy, "values": [1, 2]})
+        meta.pop("dt_ms")
+        with open(os.path.join(out, "job.json"), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
+        m = JobManager(jobs_root, CFG)
+        m.load_all()
+        job = m.get("legacy__x")
+        self.assertEqual(job.state, "open")        # 不因缺 dt_ms 被标 broken
+        self.assertAlmostEqual(job.dt_ms, 2.0)     # 从源文件 reader 补齐
+
+
+class TestSharedColorScale(unittest.TestCase):
+    """滤波前后必须共用同一色标：界限只从原始数据算一次，滤波图不被重新拉满。"""
+
+    NS, DT_MS = 256, 2.0
+    # 带外强能量（k=4 → 7.8 Hz，幅值 10）+ 带内弱信号（k=20 → 39.1 Hz，幅值 1）
+    FLT = {"f1": 20.0, "f2": 30.0, "f3": 80.0, "f4": 100.0}
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.manager = JobManager(self.root, CFG)
+        self.out = os.path.join(self.root, "job1"); os.makedirs(self.out)
+        dt = self.DT_MS / 1000.0               # 秒：f = k / (NS * dt)
+        t = np.arange(self.NS) * dt
+        slow = 10.0 * np.sin(2 * np.pi * (4 / (self.NS * dt)) * t)    # 7.8 Hz，带外强能量
+        fast = 1.0 * np.sin(2 * np.pi * (20 / (self.NS * dt)) * t)    # 39.1 Hz，带内弱信号
+        self.data = np.tile((slow + fast), (6, 1)).astype(np.float32)
+        meta = meta_for("job1", self.out)
+        self.job = self.manager.register_job(
+            meta, fake_gathers(), self.NS, lambda g, d=self.data: d)
+        self.gid = self.job.gather_ids()[0]
+
+    @staticmethod
+    def _img_span(path):
+        from PIL import Image
+        a = np.asarray(Image.open(path).convert("L"), dtype=float)
+        return float(a.max() - a.min())
+
+    def test_vlim_comes_from_raw_data_only(self):
+        v = self.job.display_vlim(self.gid)
+        self.assertAlmostEqual(v, clip_bound(self.data, self.job.clip), places=4)
+
+    def test_clean_view_reaches_bound_filtered_does_not_rescale(self):
+        vlim = self.job.display_vlim(self.gid)
+        clean = self.job.display(self.gid)
+        filt = self.job.display(self.gid, bandpass=self.FLT)
+        self.assertAlmostEqual(float(np.abs(clean).max()), vlim, places=4)  # 干净图用满色标
+        # 滤波只剩弱得多的带内信号，绝不能又被拉伸到满量程
+        self.assertLess(float(np.abs(filt).max()), 0.25 * vlim)
+
+    def test_filtered_png_span_much_smaller_than_clean(self):
+        """像素级验证：共用色标 → 滤波图对比度显著变低，而不是重新拉满。"""
+        clean = self.job.display_image(self.gid)
+        filt = self.job.display_image(self.gid, bandpass=self.FLT)
+        self.assertLess(self._img_span(filt), 0.5 * self._img_span(clean))
+
+    def test_repeat_filtered_render_is_deterministic(self):
+        """同一色标下重复渲染结果一致（色标不随数据变化漂移）。"""
+        p1 = self.job.display_image(self.gid, bandpass=self.FLT)
+        with open(p1, "rb") as fh:
+            first = fh.read()
+        os.remove(p1)
+        p2 = self.job.display_image(self.gid, bandpass=self.FLT)
+        with open(p2, "rb") as fh:
+            self.assertEqual(first, fh.read())
 
 
 if __name__ == "__main__":
