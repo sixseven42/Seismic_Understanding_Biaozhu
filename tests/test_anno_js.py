@@ -71,7 +71,7 @@ var SECS = [{id:'bx-surface_wave', classList: mkClassList(), scrollIntoView: fun
 var SAVED = 0;
 var SAVE_BTN = { click: function(){ SAVED++; } };
 var SAVE_WRAP = { querySelector: function(sel){ return sel === 'button' ? SAVE_BTN : null; } };
-var BY_ID = {'anno_featcol': {querySelectorAll: function(){ return []; }},
+var BY_ID = {'anno_featcol': {id: 'anno_featcol', querySelectorAll: function(){ return []; }},
              'btn-save': SAVE_WRAP};
 MG.forEach(function(g){ BY_ID[g.container.id] = g.container; });
 SECS.forEach(function(s){ BY_ID[s.id] = s; });
@@ -85,12 +85,76 @@ global.document = {
   getElementById: function(id){ return BY_ID[id] || null; },
   querySelector: function(){ return IMG; },
   addEventListener: function(){},
-  createElement: function(){ return { style: {} }; },
+  createElement: function(){ return {style: {}, getContext: function(){ return mkCtx(); }}; },
   querySelectorAll: function(){ return FALLBACKS; },
   get activeElement(){ return ACTIVE; },
 };
 global.setInterval = function(){ return 0; };
-global.fetch = function(){ return { then: function(){ return this; }, catch: function(){} }; };
+// setTimeout/clearTimeout 可控：scheduleTargetRefresh 的去抖靠它们，测试里手动 flush。
+// clearTimeout 必须真的有（生产代码用它取消还没到点的回读），否则 postClear 会直接抛。
+var TIMERS = {}, _tid = 0;
+global.setTimeout = function(fn){ TIMERS[++_tid] = fn; return _tid; };
+global.clearTimeout = function(id){ delete TIMERS[id]; };
+function flushTimers(){
+  var t = TIMERS; TIMERS = {};
+  Object.keys(t).forEach(function(k){ t[k](); });
+}
+// rAF 立即执行：观察者回调里经 raf() 合并的那次重绘要能跑完
+global.requestAnimationFrame = function(fn){ fn(); return 0; };
+
+// fetch 桩：记录 URL，并可让 then 链**同步**跑完，好断言回读后的状态
+var FETCHED = [], FETCH_PAYLOAD = null;
+function SyncThenable(v){
+  return {then: function(fn){ return SyncThenable(fn(v)); }, catch: function(){ return this; }};
+}
+global.fetch = function(url){
+  FETCHED.push(url);
+  if (FETCH_PAYLOAD === null){          // 默认：永不 resolve（沿用原桩行为）
+    return {then: function(){ return this; }, catch: function(){ return this; }};
+  }
+  return SyncThenable({ok: true, json: function(){ return FETCH_PAYLOAD; }});
+};
+
+// MutationObserver 桩：记下每个观察者与其观察目标，测试里手动触发 featcol 那个
+var OBSERVERS = [];
+function MO(cb){
+  this.cb = cb;
+  this.observe = function(target, opts){ OBSERVERS.push({cb: cb, target: target, opts: opts}); };
+}
+global.MutationObserver = MO;
+window.MutationObserver = MO;
+function observerOn(id){
+  for (var i = 0; i < OBSERVERS.length; i++){
+    if (OBSERVERS[i].target && OBSERVERS[i].target.id === id) return OBSERVERS[i];
+  }
+  return null;
+}
+
+// <img> / canvas 桩：setup() + place() + redraw() 要能真跑一遍（观察者是 setup 里挂的）
+var IMG_LISTENERS = {};
+IMG.addEventListener = function(t, fn){ IMG_LISTENERS[t] = fn; };
+function mkCtx(){
+  var noop = function(){};
+  return {clearRect:noop, strokeRect:noop, fillRect:noop, beginPath:noop, moveTo:noop,
+          lineTo:noop, stroke:noop, fillText:noop, setLineDash:noop,
+          measureText: function(t){ return {width: (t || '').length * 7}; }};
+}
+IMG.appendChild = function(cv){ BY_ID['anno_drag_canvas'] = cv; };
+var DOC_LISTENERS = {};
+document.addEventListener = function(t, fn){ DOC_LISTENERS[t] = fn; };
+
+// 账号栏桩：currentUser() 靠它取当前用户，fetchBoxes/postBox 没用户就直接 return
+BY_ID['who_md'] = {querySelector: function(sel){
+  return sel === 'code' ? {textContent: 'ann1'} : null;
+}};
+
+// 「✕ 清除此框」按钮桩：右键清框会程序化点它
+var CB_CLICKS = [];
+BY_ID['cb-surface_wave'] = {tagName: 'BUTTON', id: 'cb-surface_wave',
+                            click: function(){ CB_CLICKS.push('surface_wave'); }};
+BY_ID['cb-near_shot_noise'] = {tagName: 'BUTTON', id: 'cb-near_shot_noise',
+                               click: function(){ CB_CLICKS.push('near_shot_noise'); }};
+BY_ID['anno_imgcol'] = {id: 'anno_imgcol'};
 
 // ---- 载入被测脚本 ----
 __ANNO_SCRIPT__
@@ -279,6 +343,182 @@ ok(r2.x0 === 0 && r2.y0 === 0 && r2.x1 === 511 && r2.y1 === 1023,
 var r3 = T.rectFrom([10, 20], [10, 20]);
 ok(r3.x1 - r3.x0 === 0 && r3.y1 - r3.y0 === 0, '同一点应得到零面积矩形（后续会被 MIN 挡掉）');
 
+// ======================================================================
+// v3.9 新增：松开 Ctrl 成框 / 右键清框 / Ctrl 目标在服务端 outputs 之后回读
+// 这三处都是纯状态机，用存取器把状态摆到位再直接调处理函数。
+// ======================================================================
+T.setup();          // 跑一次真实 setup：观察者、事件绑定都在里面挂上
+
+function noop(){}
+function mkEvent(x, y, btn){
+  var e = {clientX: x, clientY: y, button: btn === undefined ? 0 : btn,
+           preventDefault: function(){ e._prevented = true; },
+           stopPropagation: function(){ e._stopped = true; }};
+  return e;
+}
+
+// ---- 9. 松开 Ctrl：以松开瞬间的鼠标位置作第二角 ----
+T.setBoxes({});
+T.setTarget('surface_wave');
+T.setPending({key: 'surface_wave', p: [100, 200]});
+T.setHover([300, 500]);
+T.onKeyUp({key: 'Control'});
+var kb = T.boxes()['surface_wave'];
+ok(kb && kb.x0 === 100 && kb.y0 === 200 && kb.x1 === 300 && kb.y1 === 500,
+   '松开 Ctrl 应以鼠标位置作第二角成框，实际 ' + JSON.stringify(kb));
+ok(T.pending() === null, '成框后待定第一角应被消费掉');
+
+// Cmd（Mac）/ 老 Firefox 的 OS 键同样算
+T.setBoxes({});
+T.setPending({key: 'surface_wave', p: [10, 10]});
+T.setHover([60, 70]);
+T.onKeyUp({key: 'Meta'});
+ok(T.boxes()['surface_wave'] && T.boxes()['surface_wave'].x1 === 60, 'Meta（Cmd）也应成框');
+
+// 其它键不触发
+T.setBoxes({});
+T.setPending({key: 'surface_wave', p: [10, 10]});
+T.setHover([60, 70]);
+T.onKeyUp({key: 'Shift'});
+ok(!T.boxes()['surface_wave'], '松开 Shift 不该成框');
+ok(T.pending() !== null, '未成框时待定第一角必须保留');
+
+// 松手时框太小（点完没动）→ 保留第一角，仍可用「Ctrl 再点第二角」
+T.setBoxes({});
+T.setPending({key: 'surface_wave', p: [100, 200]});
+T.setHover([101, 201]);
+T.onKeyUp({key: 'Control'});
+ok(!T.boxes()['surface_wave'], '退化框（太小的）不该成框');
+ok(T.pending() && T.pending().p[0] === 100,
+   '退化框时待定第一角不能丢（否则一次误松手就把第一角弄没了）');
+
+// 指针已离开图片（hoverNat 被 onLeave 清空）→ 不知道第二角在哪，别瞎猜
+T.setBoxes({});
+T.setPending({key: 'surface_wave', p: [100, 200]});
+T.setHover(null);
+T.onKeyUp({key: 'Control'});
+ok(!T.boxes()['surface_wave'], '指针不在图上时不该按旧位置成框');
+ok(T.pending() !== null, '指针不在图上时待定第一角应保留');
+
+// 目标已顺延（pending 与 target 不一致）→ 不落框，避免把框画给别的特征
+T.setBoxes({});
+T.setPending({key: 'surface_wave', p: [100, 200]});
+T.setHover([300, 500]);
+T.setTarget('near_shot_noise');
+T.onKeyUp({key: 'Control'});
+ok(!T.boxes()['surface_wave'], 'pending 与当前目标不符时不该成框');
+T.setTarget('surface_wave');
+T.setPending(null);
+
+// 绑定确实挂上了（keydown 之外还要有 keyup）
+ok(typeof DOC_LISTENERS['keyup'] === 'function', 'setup 应把 keyup 绑到 document 上');
+ok(IMG_LISTENERS['contextmenu'] === T.onCtxMenu, 'img 上应绑定 contextmenu 处理');
+
+// ---- 10. 右键：先清半成品，其次清鼠标下的框 ----
+T.setBoxes({surface_wave: {x0: 0, y0: 0, x1: 100, y1: 100}});
+T.setCanvas({_img: IMG, width: 512, height: 1024, getContext: function(){ return mkCtx(); }});
+CB_CLICKS.length = 0;
+
+// ① 有待定框 → 只丢弃它，不动已画好的框
+T.setPending({key: 'surface_wave', p: [10, 10]});
+var ce1 = mkEvent(50, 50, 2);
+T.onCtxMenu(ce1);
+ok(T.pending() === null, '右键应丢弃待定框');
+ok(CB_CLICKS.length === 0, '有半成品时右键不该删掉已画好的框');
+ok(T.boxes()['surface_wave'], '有半成品时右键不该动已画好的框');
+ok(ce1._prevented === true, '右键必须 preventDefault 掉浏览器菜单');
+
+// ② 无待定框 + 鼠标压在框上 → 本地立刻消失 **且**直连清框接口
+// （不再程序化点 Gradio 的「✕ 清除此框」：右键不该依赖它的 DOM 层级）
+T.setBoxes({surface_wave: {x0: 0, y0: 0, x1: 100, y1: 100}});
+FETCHED.length = 0;
+var ce2 = mkEvent(50, 50, 2);
+T.onCtxMenu(ce2);
+ok(CB_CLICKS.length === 0, '右键不该再程序化点 Gradio 清除按钮');
+ok(!T.boxes()['surface_wave'], '右键框内应立刻在本地清掉该框（点了就有反馈）');
+ok(FETCHED.filter(function(u){ return u.indexOf('/api/anno_box_clear') >= 0; }).length === 1,
+   '右键框内应直连清框接口，实际 ' + JSON.stringify(FETCHED));
+
+// 服务器确认后要回读一次目标（此时才 resolve，才能观察到回读）
+T.setBoxes({surface_wave: {x0: 0, y0: 0, x1: 100, y1: 100}});
+FETCH_PAYLOAD = {boxes: {}, target: 'near_shot_noise', note: ''};
+FETCHED.length = 0;
+T.onCtxMenu(mkEvent(50, 50, 2));
+ok(FETCHED.some(function(u){ return u.indexOf('/api/boxes') >= 0; }),
+   '清完服务端还应回读一次目标，实际 ' + JSON.stringify(FETCHED));
+ok(!T.boxes()['surface_wave'], '回读后应以服务端为准（框确实清了）');
+FETCH_PAYLOAD = null;
+
+// ③ 无待定框 + 空白处 → 什么都不做（别误删）
+T.setBoxes({surface_wave: {x0: 0, y0: 0, x1: 100, y1: 100}});
+var ce3 = mkEvent(400, 900, 2);
+FETCHED.length = 0;
+T.onCtxMenu(ce3);
+ok(T.boxes()['surface_wave'], '空白处右键不该清任何框');
+ok(FETCHED.length === 0, '空白处右键不该发任何请求，实际 ' + JSON.stringify(FETCHED));
+ok(ce3._prevented === true, '空白处右键也要吃掉浏览器菜单');
+
+// ④ 右键落在另一个特征的框上 → 清的是那一个
+T.setBoxes({surface_wave: {x0: 0, y0: 0, x1: 100, y1: 100},
+            near_shot_noise: {x0: 200, y0: 200, x1: 400, y1: 400}});
+FETCHED.length = 0;
+T.onCtxMenu(mkEvent(300, 300, 2));
+ok(T.boxes()['surface_wave'] && !T.boxes()['near_shot_noise'],
+   '右键应只清鼠标下那个框，实际 ' + JSON.stringify(T.boxes()));
+
+// ⑤ 清框前必须先取消还没到点的去抖回读 —— 否则它可能在服务端清掉**之前**发出，
+// 把刚清掉的框又拉回来（clearKey 的注释里记过同一类时序坑）。
+// FETCH_PAYLOAD 保持 null：postClear 的 then 链不 resolve，才不会掩盖"定时器有没有被取消"。
+T.setBoxes({surface_wave: {x0: 0, y0: 0, x1: 100, y1: 100}});
+T.scheduleTargetRefresh();                 // 先排一次去抖回读
+T.onCtxMenu(mkEvent(50, 50, 2));           // 紧接着右键清框 → 应把上面那次取消掉
+FETCHED.length = 0;
+flushTimers();                             // 定时器若还在，就会在这里问一次 /api/boxes
+ok(!FETCHED.some(function(u){ return u.indexOf('/api/boxes') >= 0; }),
+   '清框时必须取消更早排下的去抖回读，实际 ' + JSON.stringify(FETCHED));
+ok(!T.boxes()['surface_wave'], '框应保持清掉的状态');
+
+// ---- 11. Ctrl 目标：服务端 outputs 落到 DOM 之后才回读 ----
+// 回归锁：原来只在 document 的 change 监听里 fetchBoxes()，那比 Gradio 的
+// on_radio_change 先跑，读到的 st['partial'] 还是改之前的 —— 于是
+// 「两个都选不存在却仍能拉框」「改回存在反倒提示不存在无需画框」。
+var fcol = observerOn('anno_featcol');
+ok(fcol, 'setup 应在 #anno_featcol 上挂 MutationObserver（服务端 outputs 就写在这列）');
+
+T.setBoxes({});
+T.setTarget(null);
+T.setGrab(null);
+FETCHED.length = 0;
+FETCH_PAYLOAD = {boxes: {}, target: 'surface_wave', note: ''};
+fcol.cb();                       // 模拟 Gradio 写完 outputs → 触发观察者
+flushTimers();                   // 去抖窗口结束
+ok(FETCHED.length === 1 && FETCHED[0].indexOf('/api/boxes') >= 0,
+   'featcol 变更后应回读一次 /api/boxes，实际 ' + JSON.stringify(FETCHED));
+ok(T.targetKey() === 'surface_wave', '回读后 Ctrl 目标应更新为服务端算出的值');
+
+// 同一批变更只问一次（去抖）
+FETCHED.length = 0;
+fcol.cb(); fcol.cb(); fcol.cb();
+flushTimers();
+ok(FETCHED.length === 1, '同一批 DOM 变更只该回读一次，实际 ' + FETCHED.length);
+
+// 服务端说「两项均选不存在」→ 目标为空、提示语照原样拿到（并据此禁掉 Ctrl 画框）
+FETCHED.length = 0;
+FETCH_PAYLOAD = {boxes: {}, target: null, note: '两项均选「不存在」，本张无需画框'};
+fcol.cb(); flushTimers();
+ok(T.targetKey() === null, '服务端目标为空时应落到 null（Ctrl 随后不画框）');
+
+// 拖动/缩放中收到回读 → 不能替换 boxes，否则手上的框会被打回服务端旧值
+T.setGrab({type: 'move', key: 'surface_wave'});
+T.setBoxes({surface_wave: {x0: 1, y0: 1, x1: 9, y1: 9}});
+FETCHED.length = 0;
+FETCH_PAYLOAD = {boxes: {surface_wave: {x0: 0, y0: 0, x1: 5, y1: 5}},
+                 target: 'near_shot_noise', note: ''};
+fcol.cb(); flushTimers();
+ok(T.boxes()['surface_wave'].x0 === 1, '拖动中不该被回读覆盖本地框');
+ok(T.targetKey() === 'near_shot_noise', '拖动中目标提示仍应更新（不影响几何）');
+T.setGrab(null);
+
 console.log('ANNO_JS 逻辑检查通过');
 """
 
@@ -333,6 +573,49 @@ class TestAnnoJsLogic(unittest.TestCase):
         js = _anno_script()
         for stale in ("drawKey", "setDraw", "'bb-", "g.type === 'draw'"):
             self.assertNotIn(stale, js, f"ANNO_JS 残留旧框选模式代码: {stale}")
+
+    def test_target_refresh_waits_for_server_outputs(self):
+        """回归锁：Ctrl 目标的回读必须发生在**服务端 outputs 落到 DOM 之后**。
+
+        原来的写法是在 document 的 change 监听里 fetchBoxes()。那个监听比 Gradio 的
+        on_radio_change（写 st['partial'] 的那个）先跑，读到的还是改之前的选项；等服务端
+        跑完，该事件的 outputs 里没有图片、place() 不触发，**再没人回读** —— 于是
+        「两个都选「不存在」却仍能拉出框」「改回「存在」反倒提示不存在无需画框」。
+        行为上的检验见 _HARNESS 第 11 节；这里再锁一次触发点，免得有人图省事加回去。
+        """
+        js = _anno_script()
+        m = re.search(r"document\.addEventListener\('change'.*?\}, true\);", js, re.S)
+        self.assertIsNotNone(m, "未能在 ANNO_JS 中定位 change 监听")
+        self.assertNotIn("fetchBoxes()", m.group(0),
+                         "change 监听里又直接回读 Ctrl 目标了：那里拿到的是改之前的选项")
+        # 回读改挂在 featcol 观察者上（选项类 outputs 就写进这一列）
+        self.assertIn("function scheduleTargetRefresh()", js)
+        self.assertIn("scheduleTargetRefresh();", js)
+
+    def test_scroll_hot_path_stays_cheap(self):
+        """滚动卡顿的回归锁：滚动路径上不许做重排/重绘/抢滚动。
+
+        v3.10.1 的卡顿三成因：①每次 scroll 同步 place()（重设 canvas.width 会重建画布
+        缓冲并清空 + 全量重绘）②place() 里顺带 paintCursor()，其中的 scrollIntoView 会
+        跟用户滚动抢方向盘 ③MutationObserver 连 class 一起听，Gradio 频繁切 class 就重排。
+        """
+        js = _anno_script()
+        # ① 几何签名守卫 + 滚动走 rAF，且监听里不直接调 place()
+        self.assertIn("sig === lastSig", js, "place() 缺少几何未变就跳过的守卫")
+        self.assertNotIn("addEventListener('scroll', function(){ if (!grab) place(); }", js,
+                         "滚动监听又变回同步 place() 了")
+        self.assertIn("addEventListener('scroll', function(){ if (!grab) raf(", js,
+                      "滚动监听应经 raf() 合并到一帧一次")
+        # ② 所有 paintCursor 调用都必须显式给「是否滚动」参数，避免重绘时抢滚动
+        self.assertNotIn("paintCursor();", js,
+                         "存在无参 paintCursor() 调用：会在重绘时抢用户滚动")
+        self.assertIn("function paintCursor(scrollIntoView)", js)
+        # ③ 观察者不再监听 class
+        self.assertIn("attributeFilter:['src']", js)
+        self.assertNotIn("attributeFilter:['src','class']", js,
+                         "观察者又在听 class 了（Gradio 切换 class 会频繁触发重排）")
+        # canvas 尺寸赋值必须判等（赋同值也会清空画布）
+        self.assertIn("if (canvas.width !== w2)", js)
 
 
 if __name__ == "__main__":

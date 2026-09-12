@@ -7,7 +7,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from segy_factory import write_sgy, _bin_header, HDR
 from gather import Gather
 from labels import LabelConfig
-from jobmanager import open_job, JobManager, JobError, finalize_regions
+import jobmanager
+from jobmanager import open_job, JobManager, JobError, finalize_regions, N_AUG
+
+# 增强图默认走后台线程渲染（save 返回时 PNG 可能还没生成）。测试要断言「存完图就在」
+# 以及「images/ 必须为空」，异步会让这些断言偶发失败 —— 全局切成同步。
+# 异步路径本身由 TestAugRenderQueue 用 aug_async=True 显式覆盖。
+jobmanager.AUG_ASYNC_DEFAULT = False
 from preprocess import clip_bound
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,6 +41,175 @@ def fake_provider(ns=200):
         rng = np.random.default_rng(abs(hash(g.gather_id)) % 2**32)
         return rng.normal(size=(g.n_traces, ns)).astype(np.float32)
     return prov
+
+class TestAugRenderQueue(unittest.TestCase):
+    """增强图后台渲染：保存不等画图、任务作废、缺失补画、单张失败不拖垮线程。
+
+    这是「保存并释放之后快速进入下一张」的核心 —— 记录同步落盘、PNG 后台补画。
+    实测 528 道 × 4000 采样下画 5 张图占掉保存等待的 82%（0.64s / 0.78s）。
+    """
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        # 本类要的正是**异步**行为：显式 aug_async=True，绕过测试模块的全局同步开关
+        self.m = JobManager(self.root, CFG, aug_async=True)
+        self.out = os.path.join(self.root, "job1")
+        os.makedirs(self.out)
+        self.job = self.m.register_job(meta_for("job1", self.out), fake_gathers(), 200,
+                                       fake_provider())
+
+    def tearDown(self):
+        self.m.aug_queue.stop()
+
+    def full_selection(self):
+        return {f.name: ("不存在" if f.option_by_label("不存在") else f.options[0].label)
+                for f in CFG.features}
+
+    def boxes(self):
+        return {f.key: {"xyxy": [1, 1, 2, 2], "traces": [0, 2], "samples": [0, 4]}
+                for f in CFG.features if f.bbox}
+
+    def images_dir(self):
+        return os.path.join(self.out, "images")
+
+    def pngs(self):
+        d = self.images_dir()
+        return set(os.listdir(d)) if os.path.isdir(d) else set()
+
+    def record_pngs(self, gid):
+        """当前记录里该道集应有的增强图文件名 —— 用来查"孤立图"。"""
+        return {os.path.basename(r["image_path"]) for r in self.job.store.records.values()
+                if r.get("augmented_from") == gid and r.get("image_path")}
+
+    def save(self, gid, user="ann1"):
+        return self.m.save("job1", user, gid, self.full_selection(), self.boxes())
+
+    def _slow_render(self, delay=0.3):
+        """把真正的渲染换成「先睡一会儿」→ 才能确定性地断言保存有没有等它。"""
+        orig = jobmanager.render_data_only
+
+        def slow(*a, **k):
+            time.sleep(delay)
+            return orig(*a, **k)
+
+        jobmanager.render_data_only = slow
+        return orig
+
+    # ---- 核心：保存不等画图 ----
+    def test_save_returns_without_waiting_for_rendering(self):
+        claim = self.m.claim("job1", "ann1")
+        orig = self._slow_render(0.3)
+        try:
+            t0 = time.perf_counter()
+            ok, rec, augs, err = self.save(claim["gid"])
+            dt = time.perf_counter() - t0
+            self.assertTrue(ok, err)
+            self.assertEqual(len(augs), 5)
+            # 同步画 5 张要 ≥1.5s；异步只该花掉写 JSON 的时间
+            self.assertLess(dt, 0.5, f"保存不该等 5 张图渲染完（实测 {dt:.2f}s）")
+            self.assertEqual(self.pngs(), set(), "此刻图还没画完，属预期")
+        finally:
+            jobmanager.render_data_only = orig
+        self.assertTrue(self.m.drain_aug(60), "排空超时")
+        self.assertEqual(self.pngs(), self.record_pngs(claim["gid"]))
+
+    def test_drain_then_images_and_records_match(self):
+        """排空之后：图和记录必须一一对应（无缺图、无孤立图）。"""
+        claim = self.m.claim("job1", "ann1")
+        gid = claim["gid"]
+        ok, rec, augs, err = self.save(gid)
+        self.assertTrue(ok, err)
+        self.assertTrue(self.m.drain_aug(60))
+        self.assertEqual(self.pngs(), self.record_pngs(gid))
+        self.assertEqual(len(self.pngs()), N_AUG)
+
+    def test_hook_fires_after_images_exist(self):
+        """云回传钩子必须在图画完之后才调 —— 否则上传的是不存在的文件。"""
+        seen = []
+        self.m.set_aug_hook(lambda job, rels: seen.append(
+            (job.job_id, [os.path.isfile(os.path.join(self.out, r)) for r in rels], rels)))
+        claim = self.m.claim("job1", "ann1")
+        self.save(claim["gid"])
+        self.assertTrue(self.m.drain_aug(60))
+        self.assertEqual(len(seen), 1, seen)
+        job_id, exists, rels = seen[0]
+        self.assertEqual(job_id, "job1")
+        self.assertTrue(all(exists), "回调时每张图都应已存在")
+        self.assertIn("labels.jsonl", rels, "labels.jsonl 也要一并回传")
+
+    # ---- 作废任务不许补出孤立图 ----
+    def test_resave_before_render_leaves_no_orphan_images(self):
+        """刚存完还没画完就又存了一次（重开修正）→ 旧任务要认出自己作废。
+
+        否则旧任务会把已被 remove_augmented 删掉的旧图**又画回来**，images/ 里就多了
+        没有记录对应的孤立图（test_jobmanager 另一个测试专门在防这个）。
+        """
+        claim = self.m.claim("job1", "ann1")
+        gid = claim["gid"]
+        orig = self._slow_render(0.3)          # 让第一次渲染来不及做完
+        try:
+            self.save(gid)                      # 第一次
+            self.save(gid)                      # 立刻再来一次 → 旧增强记录/图被删
+        finally:
+            jobmanager.render_data_only = orig
+        self.assertTrue(self.m.drain_aug(60))
+        self.assertEqual(self.pngs(), self.record_pngs(gid),
+                         "图与记录必须一一对应，不许有孤立图")
+
+    # ---- 崩溃兜底：补画缺失的图 ----
+    def test_sweep_redraws_missing_aug_image(self):
+        """模拟「进程在渲染途中被杀」：记录在、图缺 → 扫描要把它补回来。"""
+        claim = self.m.claim("job1", "ann1")
+        gid = claim["gid"]
+        self.save(gid)
+        self.assertTrue(self.m.drain_aug(60))
+        victim = sorted(self.pngs())[0]
+        os.remove(os.path.join(self.images_dir(), victim))
+        self.assertNotIn(victim, self.pngs())
+
+        self.assertEqual(self.m.sweep_missing_aug(), 1, "应发现 1 个道集缺图")
+        self.assertTrue(self.m.drain_aug(60))
+        self.assertIn(victim, self.pngs(), "缺的那张应被补画回来")
+        self.assertEqual(self.pngs(), self.record_pngs(gid))
+
+    def test_sweep_does_nothing_when_images_present(self):
+        claim = self.m.claim("job1", "ann1")
+        self.save(claim["gid"])
+        self.assertTrue(self.m.drain_aug(60))
+        self.assertEqual(self.m.sweep_missing_aug(), 0, "图都在就不该排队")
+        self.assertTrue(self.m.drain_aug(5))
+
+    def test_sweep_only_counts_gathers_with_aug_records(self):
+        """没标过的作业（没有增强记录）不该被扫描排队。"""
+        self.assertEqual(self.m.sweep_missing_aug(), 0)
+
+    # ---- 单张失败不许拖垮后台线程 ----
+    def test_render_failure_does_not_kill_worker(self):
+        claim = self.m.claim("job1", "ann1")
+        gid = claim["gid"]
+        calls = {"n": 0}
+        orig = jobmanager.apply_pipeline
+
+        def flaky(*a, **k):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("模拟单张渲染炸了")
+            return orig(*a, **k)
+
+        jobmanager.apply_pipeline = flaky
+        try:
+            self.save(gid)
+            self.assertTrue(self.m.drain_aug(60))
+        finally:
+            jobmanager.apply_pipeline = orig
+        # 第一张失败了，其余 4 张应该照画不误
+        self.assertEqual(len(self.pngs()), N_AUG - 1)
+        # 线程还活着：再存一张仍能画出来
+        claim2 = self.m.claim("job1", "ann1")
+        self.save(claim2["gid"])
+        self.assertTrue(self.m.drain_aug(60))
+        self.assertEqual(len(self.pngs()), (N_AUG - 1) + N_AUG)
+
 
 class TestJobAndManager(unittest.TestCase):
     def setUp(self):
@@ -768,6 +943,200 @@ class TestSharedColorScale(unittest.TestCase):
         p2 = self.job.display_image(self.gid, bandpass=self.FLT)
         with open(p2, "rb") as fh:
             self.assertEqual(first, fh.read())
+
+
+class TestClaimPool(unittest.TestCase):
+    """多作业作业池：标注者同时选多个作业时，从并集里按道集数比例随机抽一张。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.manager = JobManager(self.root, CFG)
+        self.jobs = {}
+        for name, n in (("A", 4), ("B", 8), ("C", 1)):
+            out = os.path.join(self.root, name); os.makedirs(out)
+            gs = []
+            for v in range(1, n + 1):
+                g = Gather(key="95-96", value=v, trace_indices=np.arange(8))
+                g.prefix = f"{name}__"
+                gs.append(g)
+            meta = meta_for(name, out)
+            self.jobs[name] = self.manager.register_job(meta, gs, 200, fake_provider())
+
+    def jid(self, name):
+        return self.jobs[name].job_id
+
+    def test_claim_pool_picks_a_real_gather(self):
+        out = self.manager.claim_pool([self.jid("A"), self.jid("B")], "ann1")
+        self.assertIsNotNone(out["gid"])
+        self.assertIn(out["job_id"], (self.jid("A"), self.jid("B")))
+        self.assertFalse(out["resume"])
+
+    def test_empty_selection_is_guided(self):
+        out = self.manager.claim_pool([], "ann1")
+        self.assertIsNone(out["gid"])
+        self.assertIn("选择", out["reason"])
+
+    def test_resume_keeps_in_progress_gather(self):
+        """已持有某作业的道集时再抽 → 回到那一张，不换新的（不丢未保存工作）。"""
+        first = self.manager.claim_pool([self.jid("A"), self.jid("B")], "ann1")
+        again = self.manager.claim_pool([self.jid("A"), self.jid("B")], "ann1")
+        self.assertTrue(again["resume"])
+        self.assertEqual(again["gid"], first["gid"])
+        self.assertEqual(again["job_id"], first["job_id"])
+
+    def test_sampling_is_proportional_to_gather_count(self):
+        """A(4) 与 B(8) 都未标注：重复归还+重抽，B 被抽中的次数应显著高于 A（约 2:1）。"""
+        counts = {"A": 0, "B": 0}
+        for _ in range(600):
+            out = self.manager.claim_pool([self.jid("A"), self.jid("B")], "ann1")
+            self.assertIsNotNone(out["gid"])
+            counts["A" if out["job_id"] == self.jid("A") else "B"] += 1
+            self.manager.release(out["job_id"], "ann1")
+        # 期望 1:2；放宽到 1:1.4 以上即可稳定通过，同时能挡住「每作业等概率」（会接近 1:1）
+        self.assertGreater(counts["B"], counts["A"] * 1.4, counts)
+
+    def test_pool_skips_other_users_leases(self):
+        claimed = self.manager.claim_pool([self.jid("C")], "ann2")   # C 只有 1 张
+        self.assertIsNotNone(claimed["gid"])
+        out = self.manager.claim_pool([self.jid("C")], "ann1")
+        self.assertIsNone(out["gid"])
+        self.assertTrue(out["reason"], "池空必须给出原因")
+
+    def test_pool_reports_all_done(self):
+        """选中的作业全部标完 → 提示「已全部标注」。"""
+        m = self.manager
+        jid = self.jid("C")
+        gid = m.claim_pool([jid], "ann1")["gid"]
+        self.assertTrue(m.record(jid, gid) is None)
+        # 每个特征取合法项；bbox 特征置「不存在」免画框（否则 save 会因缺框被拒）
+        sel = {f.name: ("不存在" if f.option_by_label("不存在") else f.options[0].label)
+               for f in CFG.features}
+        ok, rec, _augs, err = m.save(jid, "ann1", gid, sel, {})
+        self.assertTrue(ok, err)                       # 别让 save 静默失败而误判
+        out = m.claim_pool([jid], "ann1")
+        self.assertIsNone(out["gid"])
+        self.assertIn("全部标注", out["reason"])
+
+    def test_pool_avoids_recently_skipped_then_falls_back(self):
+        """跳过避让：跳过的那张不会被立刻又抽到；池子里只剩它时才回来。"""
+        jid = self.jid("C")                                   # 只有 1 张
+        first = self.manager.claim_pool([jid], "ann1")
+        self.assertEqual(self.manager.skip_release(jid, "ann1"), first["gid"])
+        second = self.manager.claim_pool([jid], "ann1")       # 只剩跳过的那张 → 回退领它
+        self.assertEqual(second["gid"], first["gid"])
+
+        jid_ab = [self.jid("A"), self.jid("B")]
+        got = self.manager.claim_pool(jid_ab, "ann2")
+        self.manager.skip_release(got["job_id"], "ann2")
+        for _ in range(30):                                   # 还有别的可领 → 不该回到它
+            nxt = self.manager.claim_pool(jid_ab, "ann2")
+            self.assertIsNotNone(nxt["gid"])
+            self.assertNotEqual(nxt["gid"], got["gid"])
+            self.manager.release(nxt["job_id"], "ann2")
+
+    def test_pool_progress_aggregates(self):
+        lab, tot, n = self.manager.pool_progress([self.jid("A"), self.jid("B")])
+        self.assertEqual((lab, tot, n), (0, 12, 2))
+        self.assertEqual(self.manager.pool_progress([]), (0, 0, 0))
+        # 不存在的作业 id 不计入
+        self.assertEqual(self.manager.pool_progress(["nope", self.jid("C")]), (0, 1, 1))
+
+    def test_same_gid_in_two_jobs_stays_separate(self):
+        """两个作业抽自**同一个 sgy**（gid 完全一样）时，产物仍各进各的目录。
+
+        这是最容易串数据的场景：gid 相同，靠的是「每个作业各自有 output_dir / store」。
+        """
+        root = tempfile.mkdtemp()
+        m = JobManager(root, CFG)
+        jobs = []
+        for name in ("A", "B"):
+            out = os.path.join(root, name)
+            os.makedirs(out)
+            # 每个作业只有一个道集，且前缀相同（= 抽自同一个 sgy）→ 两边 gid 完全一样
+            g = Gather(key="95-96", value=1, trace_indices=np.arange(8))
+            g.prefix = "same__"
+            jobs.append(m.register_job(meta_for(name, out), [g], 200, fake_provider()))
+        a, b = jobs
+        self.assertEqual(a.gather_ids(), b.gather_ids(), "前提：两个作业的 gid 确实相同")
+        gid = a.gather_ids()[0]
+
+        sel = {f.name: ("不存在" if f.option_by_label("不存在") else f.options[0].label)
+               for f in CFG.features}
+        # 各自正常领取（走真实租约校验）后保存同一个 gid
+        gid_a = m.claim(a.job_id, "ann1")["gid"]
+        gid_b = m.claim(b.job_id, "ann2")["gid"]
+        self.assertEqual(gid_a, gid_b)          # 同名道集，却是两个作业各自的任务
+        ok_a, rec_a, augs_a, err_a = m.save(a.job_id, "ann1", gid_a, sel, {})
+        ok_b, rec_b, augs_b, err_b = m.save(b.job_id, "ann2", gid_b, sel, {})
+        self.assertTrue(ok_a, err_a)
+        self.assertTrue(ok_b, err_b)
+
+        # 目录彼此独立，各自的记录/npy/图都落在自己这边
+        self.assertNotEqual(a.output_dir, b.output_dir)
+        self.assertEqual(len(a.store.records), len(b.store.records))
+        for job, augs, who in ((a, augs_a, "ann1"), (b, augs_b, "ann2")):
+            self.assertTrue(os.path.isfile(os.path.join(job.output_dir, "labels.jsonl")))
+            self.assertTrue(os.path.isfile(os.path.join(job.output_dir, "npy", f"{gid}.npy")))
+            self.assertTrue(os.path.isdir(os.path.join(job.output_dir, "images")))
+            self.assertEqual(job.store.get(gid)["annotated_by"], who)
+            for aug in augs:
+                self.assertTrue(os.path.isfile(
+                    os.path.join(job.output_dir, aug["image_path"])))
+        # 第二次保存（进 B）没有污染 A 的记录：各自只该有「1 条基础 + N_AUG 条增强」
+        self.assertEqual(len(a.store.records), 1 + len(augs_a))
+        self.assertEqual(len(b.store.records), 1 + len(augs_b))
+
+    def test_user_counts_across_jobs_and_base_records_only(self):
+        """按用户统计标注**张数**：跨作业累加，且只数基础记录（别把 5 张增强图算成 5 张）。"""
+        m = self.manager
+        sel = {f.name: ("不存在" if f.option_by_label("不存在") else f.options[0].label)
+               for f in CFG.features}
+        # ann1 标 A 的两张、B 的一张；ann2 标 B 的一张
+        for jid, who, n in ((self.jid("A"), "ann1", 2), (self.jid("B"), "ann1", 1),
+                            (self.jid("B"), "ann2", 1)):
+            for _ in range(n):
+                gid = m.claim_pool([jid], who)["gid"]
+                ok, _rec, augs, err = m.save(jid, who, gid, sel, {})
+                self.assertTrue(ok, err)
+                self.assertEqual(len(augs), N_AUG)      # 每次保存确实写了 N_AUG 条增强
+        counts = m.user_counts()
+        self.assertEqual(counts.get("ann1"), 3, counts)   # 不是 3×(N_AUG+1)
+        self.assertEqual(counts.get("ann2"), 1, counts)
+        self.assertEqual(m.user_count("ann1"), 3)
+        self.assertEqual(m.user_count("没这个人"), 0)
+        self.assertEqual(sum(counts.values()), 4)
+
+    def test_user_count_keeps_original_annotator_on_overwrite(self):
+        """他人覆盖已标道集时归属不变（save 会保留原标注者）→ 总量不该平移。"""
+        m = self.manager
+        sel = {f.name: ("不存在" if f.option_by_label("不存在") else f.options[0].label)
+               for f in CFG.features}
+        jid = self.jid("C")
+        gid = m.claim_pool([jid], "ann1")["gid"]
+        self.assertTrue(m.save(jid, "ann1", gid, sel, {})[0])
+        self.assertEqual(m.user_count("ann1"), 1)
+        # admin 覆盖重标同一张
+        self.assertTrue(m.save(jid, "boss", gid, sel, {}, is_admin=True)[0])
+        self.assertEqual(m.user_count("ann1"), 1, "覆盖后仍归原标注者")
+        self.assertEqual(m.user_count("boss"), 0)
+
+    def test_user_counts_ignores_deleted_jobs(self):
+        """软删除的作业不计入统计（它与 list_jobs 的口径一致）。"""
+        m = self.manager
+        sel = {f.name: ("不存在" if f.option_by_label("不存在") else f.options[0].label)
+               for f in CFG.features}
+        jid = self.jid("C")
+        gid = m.claim_pool([jid], "ann1")["gid"]
+        self.assertTrue(m.save(jid, "ann1", gid, sel, {})[0])
+        self.assertEqual(m.user_count("ann1"), 1)
+        m.delete_job(jid)
+        self.assertEqual(m.user_count("ann1"), 0, "已删除作业不该再计入标注总量")
+
+    def test_claim_pool_ignores_unknown_and_closed(self):
+        self.manager.set_state(self.jid("A"), "closed")
+        out = self.manager.claim_pool([self.jid("A"), "不存在"], "ann1")
+        self.assertIsNone(out["gid"])
+        self.assertIn("未开放", out["reason"])
 
 
 if __name__ == "__main__":

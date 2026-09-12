@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 import unittest
 
-from web_core import (IMG_W, IMG_H, active_filter, box_target, fmt_option,
-                      jobs_progress_html, label_of, parse_filter, pixel_box_to_data)
+from web_core import (IMG_W, IMG_H, active_filter, box_note, box_target, fmt_option,
+                      jobs_progress_html, label_of, parse_filter, pixel_box_to_data,
+                      prev_gid, staff_counts_html)
 
 
 class _Opt:
@@ -214,6 +215,96 @@ class TestBoxTarget(unittest.TestCase):
 
     def test_none_boxes_tolerated(self):
         self.assertEqual(box_target(self.feats, None, None), "surface_wave")
+
+
+class TestBoxNote(unittest.TestCase):
+    """目标为空时的兜底文案：不能对用户说"已完成"（那会让人以为任务被重发了）。"""
+
+    def setUp(self):
+        self.feats = [_Feat("面波", "surface_wave"), _Feat("近炮点强能量噪声", "near_shot_noise")]
+
+    def test_no_target_due_to_all_absent_says_not_needed(self):
+        sel = {"面波": "不存在", "近炮点强能量噪声": "不存在"}
+        note = box_note(self.feats, sel, None)
+        self.assertIn("不存在", note)
+        self.assertIn("无需画框", note)
+
+    def test_no_target_and_no_gather_is_silent(self):
+        """没有当前道集时（池子标完）必须返回空串 —— 前端据此**什么都不画**。"""
+        self.assertEqual(box_note(self.feats, {}, None), "")
+        self.assertEqual(box_note(self.feats, {"面波": "存在"}, None), "")
+
+    def test_with_target_has_no_note(self):
+        self.assertEqual(box_note(self.feats, {"面波": "存在"}, "surface_wave"), "")
+
+    def test_no_bbox_features_says_no_boxing(self):
+        self.assertEqual(box_note([], {}, None), "本题不需要画框")
+
+
+class TestStaffCountsHtml(unittest.TestCase):
+    """管理员可见的「各用户标注总量」表。"""
+
+    def test_lists_users_with_counts_and_total(self):
+        html = staff_counts_html([("boss", "管理员", 3), ("ann1", "标注者", 12)])
+        self.assertIn("staff-counts", html)
+        self.assertIn("boss", html)
+        self.assertIn("管理员", html)
+        self.assertIn("ann1", html)
+        self.assertIn(">12<", html)
+        self.assertIn("合计", html)
+        self.assertIn(">15<", html)          # 3 + 12
+
+    def test_zero_count_user_still_listed(self):
+        html = staff_counts_html([("ann2", "标注者", 0)])
+        self.assertIn("ann2", html)
+        self.assertIn(">0<", html)
+
+    def test_bad_count_treated_as_zero(self):
+        html = staff_counts_html([("ann1", "标注者", None), ("ann2", "标注者", "x")])
+        self.assertIn(">0<", html)
+
+    def test_empty_rows(self):
+        self.assertIn("暂无账号", staff_counts_html([]))
+
+    def test_escapes_username(self):
+        html = staff_counts_html([("<b>x</b>", "标注者", 1)])
+        self.assertNotIn("<b>x</b>", html)
+        self.assertIn("&lt;b&gt;", html)
+
+
+class TestPrevGid(unittest.TestCase):
+    """「↩ 返回上一张」：历史栈弹一格，栈空表示已是最早一张。"""
+
+    def test_empty_history_means_no_target(self):
+        self.assertEqual(prev_gid([], "G5"), (None, []))
+
+    def test_none_history_means_no_target(self):
+        self.assertEqual(prev_gid(None, None), (None, []))
+
+    def test_pops_top_and_shrinks_history(self):
+        """一次退一格：目标=栈顶，且目标本身也从历史里去掉（不能来回抖）。"""
+        self.assertEqual(prev_gid(["G1", "G2", "G3"], "G4"), ("G3", ["G1", "G2"]))
+        self.assertEqual(prev_gid(["G1", "G2"], "G3"), ("G2", ["G1"]))
+
+    def test_last_step_empties_history(self):
+        self.assertEqual(prev_gid(["G1"], "G2"), ("G1", []))
+
+    def test_walks_all_the_way_back_then_stops(self):
+        """连续往回翻：G4 → G3 → G2 → G1 → 提示已是最早一张。"""
+        hist, cur = ["G1", "G2", "G3"], "G4"
+        seen = []
+        for _ in range(5):
+            cur, hist = prev_gid(hist, cur)
+            seen.append(cur)
+        self.assertEqual(seen, ["G3", "G2", "G1", None, None])
+        self.assertEqual(hist, [])
+
+    def test_current_gid_duplicated_on_top_is_skipped(self):
+        """防御：当前道集不该被压在栈顶，真出现了也要能继续退，而不是原地卡住。"""
+        self.assertEqual(prev_gid(["G1", "G2", "G4"], "G4"), ("G2", ["G1"]))
+
+    def test_blank_entries_ignored(self):
+        self.assertEqual(prev_gid(["", None, "G1"], "G2"), ("G1", []))
 
 
 if __name__ == "__main__":

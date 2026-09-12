@@ -76,7 +76,56 @@ def active_filter(st: dict, gid: str) -> dict | None:
     return params
 
 
+def staff_counts_html(rows) -> str:
+    """各用户标注总量表（仅管理员的管理区显示）。
+
+    rows: [(用户名, 角色中文, 标注张数), ...]，按调用方给的顺序展示。
+    只做展示，不做权限判断 —— 该 HTML 只挂在管理员可见的区块里。
+    """
+    body = []
+    total = 0
+    for name, role, n in rows:
+        try:
+            cnt = int(n)
+        except (TypeError, ValueError):
+            cnt = 0
+        total += cnt
+        body.append(
+            "<tr>"
+            f"<td class='sc-user'>{html.escape(str(name))}</td>"
+            f"<td class='sc-role'>{html.escape(str(role))}</td>"
+            f"<td class='sc-count'>{cnt}</td>"
+            "</tr>")
+    if not body:
+        return "<p class='jp-empty'>暂无账号</p>"
+    head = ("<table class='staff-counts'>"
+            "<tr><th>用户</th><th>角色</th><th>标注张数</th></tr>")
+    tail = (f"<tr class='sc-total'><td>合计</td><td></td>"
+            f"<td class='sc-count'>{total}</td></tr>")
+    return head + "".join(body) + tail + "</table>"
+
+
 ABSENT_LABEL = "不存在"
+
+
+def box_note(feats, selection: dict, target: str | None) -> str:
+    """画布提示语的兜底文案 —— 目标为空时给一句**准确**的说明，别乱说"已完成"。
+
+    target 为空只可能是三种情况，含义完全不同：
+      1. 本题两个带框特征都选了「不存在」→ 根本不需要画框（不是"已完成"）；
+      2. 特征配置里没有带框特征 → 本题不涉及框选；
+      3. 没有当前道集（池子标完/未领取）→ 此时前端应**什么都不画**。
+    前两种给说明，第三种返回空串（前端据此隐藏提示）。
+    """
+    if target:
+        return ""
+    feats = list(feats or [])
+    if not feats:
+        return "本题不需要画框"
+    sel = selection or {}
+    if all(sel.get(f.name) == ABSENT_LABEL for f in feats):
+        return "两项均选「不存在」，本张无需画框"
+    return ""
 
 
 def box_target(feats, selection: dict, boxes: dict) -> str | None:
@@ -112,6 +161,27 @@ def box_target(feats, selection: dict, boxes: dict) -> str | None:
         if not is_absent(f):
             return f.key
     return None
+
+
+def prev_gid(hist, cur: str | None = None) -> tuple[str | None, list[str]]:
+    """「↩ 返回上一张」的下一步：返回 (目标道集, 回退后的 hist)。
+
+    hist = 当前道集**之前**访问过的道集，按访问先后（旧→新）排列，**不含**当前道集；
+    显示的道集一变就往里压旧的，所以它是「浏览历史」而不是「标注顺序」。
+    这正是不能用「我标注的」列表顺序代替的原因：那张表按**首次标注时间**排序
+    （见 storage.LabelStore.upsert：已存在的 gid 不挪位），修正保存不会让记录回到末尾，
+    于是「刚返回并修好 G3」之后按表顺序会翻到别的地方去。
+
+    栈空 → (None, [])，调用方据此提示「已是最早一张」。
+    cur 只作防御：万一当前道集被重复压在栈顶（不该发生），先剔除再取栈顶，
+    免得「返回上一张」原地不动、看起来像按钮失灵。
+    """
+    h = [g for g in (hist or []) if g]
+    if cur and h and h[-1] == cur:
+        h.pop()
+    if not h:
+        return None, []
+    return h[-1], h[:-1]
 
 
 _STATE_CN = {"open": "进行中", "closed": "已关闭", "broken": "异常"}

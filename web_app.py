@@ -24,8 +24,9 @@ import gradio as gr
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from web_core import (ABSENT_LABEL, active_filter, box_target, fmt_option,
-                      jobs_progress_html, label_of, parse_filter, pixel_box_to_data)
+from web_core import (ABSENT_LABEL, active_filter, box_note, box_target, fmt_option,
+                      jobs_progress_html, label_of, parse_filter, pixel_box_to_data,
+                      prev_gid, staff_counts_html)
 from labels import LabelConfig
 from users import Accounts
 from jobmanager import JobManager, JobError, N_AUG
@@ -51,12 +52,33 @@ Accounts.ensure_default(USERS_PATH)
 
 CFG = LabelConfig(CONFIG_PATH)
 ACC = Accounts(USERS_PATH)
-JM = JobManager(JOBS_ROOT, CFG)
 UP = Uploader(load_config(COS_PATH))
+
+
+def make_jm(root: str) -> JobManager:
+    """建 JobManager 并挂上云回传钩子。
+
+    增强图的 PNG 现在是**后台线程**画的，所以上传必须挂在「图画完」的回调上，
+    不能在保存请求里就地 enqueue（那时图还不存在）。回调里惰性取模块级 UP，
+    测试替换 web_app.UP 后依然生效。
+
+    测试若要替换 web_app.JM，请用本函数而不是直接 JobManager(...)：否则钩子不在，
+    上传那一路就等于没被覆盖到。
+    """
+    jm = JobManager(root, CFG)
+    jm.set_aug_hook(lambda job, rels: UP.enqueue(job.job_id, job.output_dir, rels))
+    return jm
+
+
+JM = make_jm(JOBS_ROOT)
 UP.start()
 JM.load_all()
+# 补画上次进程被杀时没来得及画的增强图。放后台线程，绝不拖慢启动。
+threading.Thread(target=JM.sweep_missing_aug, name="aug-sweep", daemon=True).start()
 
-# 每用户工作态：{username: {"job_id","gid","partial","boxes","filter","filter_params"}}
+# 每用户工作态：{username: {"job_ids","job_id","gid","partial","boxes","filter","filter_params"}}
+#   job_ids: 选中的作业（可多个）—— 抽道集时把它们的可领道集摊平后等概率随机抽
+#   job_id:  当前道集所属作业（保存/进度/滤波参数都按它走，随每张道集变）
 #   partial: {特征名: 选项label}（未保存的 Radio 选择）；boxes: {特征key: box|None}（未保存的框）
 #   filter: {gid, f1..f4}（仅对当前道集生效，换道集即失效）
 #   filter_params: {job_id: {f1..f4}}（按作业记忆的滤波参数，同作业内统一）
@@ -67,6 +89,41 @@ WORK_LOCK = threading.RLock()
 def wstate(user: str) -> dict:
     with WORK_LOCK:
         return WORK.setdefault(user, {})
+
+
+# ---- 「↩ 返回上一张」的浏览历史 ----
+# st["hist"] = 当前道集**之前**访问过的道集（旧→新），不含当前道集。
+# 用浏览历史而不是「我标注的」列表顺序：那张表按首次标注时间排序（storage.LabelStore.upsert
+# 对已存在的 gid 不挪位），修正保存不会让记录回到末尾，靠它「返回上一张」会翻到别处去。
+def _push_hist(st: dict, gid: str | None):
+    """把 gid 压进浏览历史；空值忽略，连续重复的不重复压。"""
+    if not gid:
+        return
+    hist = [g for g in (st.get("hist") or []) if g]
+    if hist and hist[-1] == gid:
+        return
+    hist.append(gid)
+    st["hist"] = hist
+
+
+def _has_unsaved_input(st: dict) -> bool:
+    """当前道集有没有未保存的作答（选项或框）。
+
+    用于「返回上一张」前判断能不能直接把手上这张归还回池：刚领来一张就点回去的情况
+    一个字都没填，不该拦；真答过了才值得问一句。服务端状态忠实反映用户输入 ——
+    改选项走 on_radio_change 写 st['partial']，画框走 /api/anno_box 写 st['boxes']。
+    """
+    return (any((st.get("partial") or {}).values())
+            or any((st.get("boxes") or {}).values()))
+
+
+def _visit(st: dict, job_id: str, gid: str):
+    """把显示切到 (job_id, gid)，并把**原来那张**压进浏览历史。"""
+    old = st.get("gid")
+    if old and old != gid:
+        _push_hist(st, old)
+    st["job_id"] = job_id
+    st["gid"] = gid
 
 
 def _user(request) -> str:
@@ -89,13 +146,38 @@ def _job_choices(user: str) -> list[str]:
             if j["state"] == "open" or JM.mine(j["job_id"], user)]
 
 
-def _mine_choices(user: str, job_id: str | None) -> list[str]:
-    if not job_id:
+def _norm_job_ids(job_ids) -> list[str]:
+    """把下拉的值（多选是 list；单选/空是 str/None）统一成去重的作业 id 列表。"""
+    if not job_ids:
         return []
-    try:
-        return [r["gather_id"] for r in JM.mine(job_id, user)]
-    except JobError:
-        return []
+    if isinstance(job_ids, str):
+        job_ids = [job_ids]
+    return [j for j in dict.fromkeys(str(x) for x in job_ids if x)]
+
+
+def _mine_choices(user: str, job_ids) -> list[str]:
+    """「我标注的」= 选中作业的并集（多作业下按各作业内顺序拼接）。"""
+    out = []
+    for jid in _norm_job_ids(job_ids):
+        try:
+            out.extend(r["gather_id"] for r in JM.mine(jid, user))
+        except JobError:
+            continue
+    return out
+
+
+def _job_of_gid(user: str, gid: str, job_ids) -> str | None:
+    """该 gid 属于选中作业里的哪一个（重开「我标注的」时定位）。
+
+    注：同一个 sgy 文件建的两个作业会产生相同 gid，此时取第一个匹配到的作业。
+    """
+    for jid in _norm_job_ids(job_ids):
+        try:
+            if JM.record(jid, gid) is not None:
+                return jid
+        except JobError:
+            continue
+    return None
 
 
 # ----------------------------------------------------------------------
@@ -206,6 +288,30 @@ def box_statuses_of(request: gr.Request) -> list[str]:
     return outs
 
 
+def _my_total_text(user: str) -> str:
+    """标注区常驻的「我的累计标注」文案（跨全部作业，不区分作业）。"""
+    return f"**我的累计标注：{JM.user_count(user)} 张**（跨全部作业）"
+
+
+def _staff_rows():
+    """管理员用：[(用户名, 角色, 标注张数)] —— 列出 users.yaml 里的全部账号（含 0 张的）。"""
+    counts = JM.user_counts()
+    return [(name, "管理员" if ACC.role(name) == "admin" else "标注者",
+             counts.get(name, 0))
+            for name in ACC.names()]
+
+
+def _progress_text(job, st: dict) -> str:
+    """进度文案：本作业 + 整个作业池汇总（多选多个作业时才有池汇总）。"""
+    n_lab, n_tot = JM.progress(job.job_id)
+    txt = f"本作业 {n_lab}/{n_tot}"
+    job_ids = _norm_job_ids(st.get("job_ids"))
+    if len(job_ids) > 1:
+        p_lab, p_tot, n_job = JM.pool_progress(job_ids)
+        txt += f" ｜ 作业池 {p_lab}/{p_tot}（共 {n_job} 个作业）"
+    return txt
+
+
 def show_current(request: gr.Request):
     """返回当前道集的所有显示组件值（img, info, sentence, *radios, *box_statuses）。"""
     user = _user(request)
@@ -213,22 +319,27 @@ def show_current(request: gr.Request):
     job = JM.get(st["job_id"])
     gid = st["gid"]
     img = render_display(request)
-    n_labeled, total = JM.progress(st["job_id"])
     meta = job.gather_meta(gid)
     rec = job.store.get(gid)
     state = "已标注 ✔" if rec else "未标注"
     info = (f"**道集 {gid}** | 键 {meta['key']} = {meta['value_text']}"
-            f" | {meta['n_traces']} 道 | {state} | 作业总进度 **{n_labeled}/{total}**")
+            f" | {meta['n_traces']} 道 | {state} | {_progress_text(job, st)}")
     sel = _selection(job, gid, st)
     sentence = CFG.render_sentence(sel)
     return (img, info, sentence, *_radio_updates(job, gid, st), *box_statuses_of(request),
-            *_filter_fields(user))
+            *_filter_fields(user), _my_total_text(user))
 
 
 def _anno_idle(msg: str = ""):
-    """无当前道集时的标注区空态输出（img 不动、radio 不动、状态占位）。"""
-    return (gr.skip(), msg, "", *([gr.Radio()] * len(CFG.features)),
-            *(["…"] * len(bbox_feats())), *((gr.skip(),) * len(FILTER_KEYS)))
+    """无当前道集时的标注区空态输出。
+
+    **图片要清掉**（而不是 gr.skip 留着旧图）：池子标完 / 未领取时若把上一张留在屏幕上，
+    标注者会以为"这张已完成的任务又发给我了"（实测反馈过的误解）。
+    radio 与参数字段保持不动（与旧图一起清掉反而会让用户以为选错了张）。
+    """
+    return (gr.update(value=None), msg, "", *([gr.Radio()] * len(CFG.features)),
+            *(["…"] * len(bbox_feats())), *((gr.skip(),) * len(FILTER_KEYS)),
+            gr.skip())
 
 
 def refresh_anno(request: gr.Request):
@@ -369,62 +480,77 @@ def create_job_ui(request: gr.Request, path, endian_text, sort_text, gkey_text,
     mgr_choices = [j["job_id"] for j in JM.list_jobs()]
     return (f"✔ 已创建作业 {job.job_id}（键 {ranges_label(gkeys)}）｜道集数 {n}{note}"
             f"｜保存时每张增强 {N_AUG} 个随机 clip",
-            gr.update(choices=job_choices, value=job.job_id),
+            gr.update(choices=job_choices, value=[job.job_id]),
             gr.update(choices=mgr_choices, value=job.job_id))
 
 
 # ----------------------------------------------------------------------
 # 标注流程 handler
 # ----------------------------------------------------------------------
-def open_job_for(request: gr.Request, job_id: str):
-    """选中作业即**自动领取第一张**（不必再点「领取下一张」）。
+def select_jobs(request: gr.Request, job_ids):
+    """选中作业（可多选）即**自动从作业池随机领一张**（不必再点「领取下一张」）。
 
-    - 重复选中同一作业、且手上还压着一张没保存的：原样不动，避免白白丢掉未保存的选择/框。
-    - 换作业：清掉上一张的暂存态再领（未保存的内容会丢，这是换作业的既有语义）。
+    - 选择没变、且手上还压着一张没保存的：原样不动，避免白白丢掉未保存的选择/框。
+    - 选择变了：清掉上一张的暂存态再领（未保存的内容会丢，这是换选择的既有语义）。
     - 领不到（已关闭/已标完/全被占）时直接把原因显示出来，比让用户去点按钮再看到更清楚。
     """
     user = _user(request)
     st = wstate(user)
-    mine = gr.update(choices=_mine_choices(user, job_id) if job_id else [], value=None)
-    if not job_id:
-        return (*_anno_idle("⚠️ 请选择作业"), mine)
-    if st.get("job_id") == job_id and st.get("gid"):
-        return (*refresh_anno(request), mine)          # 同一作业 → 保持现状
-    st["job_id"] = job_id
-    for k in ("gid", "partial", "boxes", "filter"):
+    job_ids = _norm_job_ids(job_ids)
+    mine = gr.update(choices=_mine_choices(user, job_ids), value=None)
+    if not job_ids:
+        return (*_anno_idle("⚠️ 请选择作业（可多选）"), mine)
+    if st.get("job_ids") == job_ids and st.get("gid"):
+        return (*refresh_anno(request), mine)          # 选择没变 → 保持现状
+    st["job_ids"] = job_ids
+    # hist 一并清掉：换作业选择是**显式换了上下文**，「返回上一张」不该退回上一套选择的道集
+    for k in ("gid", "job_id", "partial", "boxes", "filter", "hist"):
         st.pop(k, None)
-    out = JM.claim(job_id, user)
-    if out.get("gid"):
-        st["gid"] = out["gid"]
-        st["partial"], st["boxes"] = {}, {}
-        return (*show_current(request), mine)
-    n_labeled, total = JM.progress(job_id)
-    if total and n_labeled >= total:
-        return (*_anno_idle(f"🎉 本作业已全部标注（{n_labeled}/{total}）"), mine)
-    return (*_anno_idle("⚠️ " + (out.get("reason") or "无任务")), mine)
+    anno, _note = _claim_from_pool(request)
+    return (*anno, mine)
 
 
-def claim_next(request: gr.Request, job_id: str):
+def _claim_from_pool(request: gr.Request):
+    """从当前选中的作业池随机领一张并显示。
+
+    返回 (anno_outputs 形状的输出, 一句状态说明)：说明用于拼在保存/跳过的提示里，
+    免得把整行道集信息塞进那些消息。
+    """
     user = _user(request)
     st = wstate(user)
-    if not job_id:
-        return _anno_idle("⚠️ 请先在「作业」下拉选择作业")
-    # 已持有本作业的未保存任务：不静默续领同一张，明确指引如何进入下一张
-    if st.get("job_id") == job_id and st.get("gid"):
-        gid = st["gid"]
-        if JM.record(job_id, gid) is None:      # 该张尚未保存
-            cur = show_current(request)
-            return (cur[0],
-                    f"⚠️ 正在标注「{gid}」（尚未保存）。要进入下一张，请先点"
-                    "「保存并释放」完成本张；要放弃本张，请先点「归还此张」。",
-                    cur[2], *cur[3:])
-    st["job_id"] = job_id
-    out = JM.claim(job_id, user)
-    if out["gid"]:
-        st["gid"] = out["gid"]
+    out = JM.claim_pool(st.get("job_ids"), user)
+    if out.get("gid"):
+        _visit(st, out["job_id"], out["gid"])   # job_id = 当前道集所属作业（保存/进度都按它走）
         st["partial"], st["boxes"] = {}, {}
-        return show_current(request)
-    return _anno_idle("⚠️ " + (out.get("reason") or "无任务"))
+        n_job = len(_norm_job_ids(st.get("job_ids")))
+        note = (f"已自动从作业池领取下一张「{out['gid']}」" if n_job > 1
+                else f"已自动领取下一张「{out['gid']}」")
+        return show_current(request), note
+    n_lab, n_tot, n_job = JM.pool_progress(st.get("job_ids"))
+    if n_tot and n_lab >= n_tot:
+        return (_anno_idle(f"🎉 选中的 {n_job} 个作业已全部标注（{n_lab}/{n_tot}）"),
+                f"选中的 {n_job} 个作业已全部标注（{n_lab}/{n_tot}）")
+    reason = out.get("reason") or "暂无剩余可领取"
+    return _anno_idle("⚠️ " + reason), "⚠️ " + reason
+
+
+def claim_next(request: gr.Request, job_ids):
+    """「领取下一张」：从选中的作业池里再随机抽一张。"""
+    user = _user(request)
+    st = wstate(user)
+    job_ids = _norm_job_ids(job_ids)
+    if not job_ids:
+        return _anno_idle("⚠️ 请先在「作业」里选择至少一个作业")
+    st["job_ids"] = job_ids
+    # 已持有未保存的任务：不静默换张，明确指引如何进入下一张
+    if st.get("gid") and JM.record(st.get("job_id") or "", st["gid"]) is None:
+        cur = show_current(request)
+        return (cur[0],
+                f"⚠️ 正在标注「{st['gid']}」（尚未保存）。要进入下一张，请先点"
+                "「保存并释放」完成本张；要放弃本张，请先点「归还此张」。",
+                cur[2], *cur[3:])
+    anno, _note = _claim_from_pool(request)
+    return anno
 
 
 def on_radio_change(request: gr.Request, *radio_values):
@@ -471,9 +597,9 @@ def _filter_outputs(request: gr.Request, msg: str, fresh_img: bool):
     st = wstate(user)
     n_other = 1 + len(CFG.features) + len(bbox_feats())   # sentence + radios + 框状态
     if not st.get("job_id") or not st.get("gid"):
-        return (gr.skip(), msg, *((gr.skip(),) * (n_other + len(FILTER_KEYS))))
+        return (gr.skip(), msg, *((gr.skip(),) * (n_other + len(FILTER_KEYS))), gr.skip())
     img = render_display(request) if fresh_img else gr.skip()
-    return (img, msg, *((gr.skip(),) * n_other), *_filter_fields(user))
+    return (img, msg, *((gr.skip(),) * n_other), *_filter_fields(user), gr.skip())
 
 
 def toggle_filter(request: gr.Request, f1, f2, f3, f4):
@@ -534,6 +660,24 @@ def apply_drag_box(user: str, key: str, x0, y0, x1, y1) -> tuple[bool, str]:
     return True, key
 
 
+def clear_drag_box(user: str, key: str) -> tuple[bool, str]:
+    """清掉该用户当前道集里某特征的框（右键清框用）。
+
+    与「✕ 清除此框」按钮**同一服务端语义**（把 st['boxes'][key] 置 None、保存时按 None 处理），
+    但走自定义 HTTP 接口而不是程序化点那个按钮：右键的行为不该依赖 Gradio 按钮在 DOM 里
+    的层级/结构（elem_id 落在 <button> 还是外层 div 上，各版本不一样）。
+    """
+    if key not in [f.key for f in bbox_feats()]:
+        return False, f"非框选特征: {key}"
+    with WORK_LOCK:
+        st = WORK.setdefault(user, {})
+        if not st.get("job_id") or not st.get("gid"):
+            return False, "没有正在标注的道集"
+        st["boxes"] = dict(st.get("boxes") or {})
+        st["boxes"][key] = None
+    return True, key
+
+
 def _boxes_payload(user: str) -> dict:
     """当前道集各 bbox 特征的框 + Ctrl 两点框选的当前目标特征。
 
@@ -544,12 +688,12 @@ def _boxes_payload(user: str) -> dict:
         可单测；前端不必去猜 DOM 里的选项状态），前端据此决定 Ctrl 左键画给谁。
     """
     st = wstate(user)
-    boxes_out, target = {}, None
+    boxes_out, target, note = {}, None, ""
     if st.get("job_id") and st.get("gid"):
         try:
             job = JM.get(st["job_id"])
         except JobError:
-            return {"boxes": boxes_out, "target": None}
+            return {"boxes": boxes_out, "target": None, "note": ""}
         boxes = _current_boxes(job, st["gid"], st)
         for f in bbox_feats():
             b = boxes.get(f.key)
@@ -557,8 +701,12 @@ def _boxes_payload(user: str) -> dict:
                 x0, y0, x1, y1 = b["xyxy"]
                 boxes_out[f.key] = {"x0": int(x0), "y0": int(y0),
                                     "x1": int(x1), "y1": int(y1)}
-        target = box_target(bbox_feats(), _selection(job, st["gid"], st), boxes)
-    return {"boxes": boxes_out, "target": target}
+        sel = _selection(job, st["gid"], st)
+        target = box_target(bbox_feats(), sel, boxes)
+        note = box_note(bbox_feats(), sel, target)
+    # note 只在「目标为空」时有值：给前端一句准确说明（如「两项均选不存在，无需画框」）；
+    # 没有当前道集时为空串 → 前端**不画任何提示**（否则旧图上会浮出误导性的"已完成"）
+    return {"boxes": boxes_out, "target": target, "note": note}
 
 
 def save_anno(request: gr.Request, *radio_values):
@@ -573,11 +721,19 @@ def save_anno(request: gr.Request, *radio_values):
         if v:
             sel[feat.name] = label_of(v)
     st["partial"] = sel
+    # 保存前这张是否已有记录 → 区分「首次标注」与「修正已有结果」。两者收尾不同：
+    # 首次标注保存后自动领下一张；修正保存原地停住（见下方 was_labeled 分支）。
+    try:
+        was_labeled = JM.record(job_id, gid) is not None
+    except JobError:
+        was_labeled = False
     # 空闲超 TTL 导致租约被清：renew 只续「仍有效」的租约，返回 None。
     # 区分两种无租约场景：
     #   (a) 该道集尚未标注（首次领取后闲挂超时被清）→ 尝试重新领取同 gid；
     #   (b) 该道集已有记录（重开自己标过的记录，本就无租约）→ 直接走 owner 归属保存。
     if JM.renew(job_id, user) is None and JM.record(job_id, gid) is None:
+        # 这里**故意只在本作业里**重领（不要改成 claim_pool）：目的是把要保存的那张
+        # 重新纳回自己的租约，换到别的作业毫无意义；claim 没发回同一个 gid 就说明它已被占。
         c = JM.claim(job_id, user)
         if c.get("gid") != gid:
             cur = show_current(request)
@@ -591,29 +747,24 @@ def save_anno(request: gr.Request, *radio_values):
     if not ok:
         cur = show_current(request)
         return (cur[0], "⚠️ " + err, cur[2], *cur[3:])
-    # 云上传（异步，失败绝不阻塞/回滚标注）：本次落盘的 N_AUG 张增强图 + labels.jsonl
-    rels = [a["image_path"] for a in aug_recs if a.get("image_path")]
-    rels.append("labels.jsonl")
-    UP.enqueue(job_id, JM.get(job_id).output_dir, rels)
+    # 云上传由增强图后台渲染完成后的钩子统一触发（JM.set_aug_hook）：那 5 张 PNG 是后台
+    # 画的，只有画完才谈得上上传；labels.jsonl 同步落盘但那点延迟无所谓。
     n_labeled, total = JM.progress(job_id)
-    st.pop("gid", None)
     st.pop("partial", None)
     st.pop("boxes", None)
-    # 保存并释放 → 自动领取下一张（保持原「保存并下一张」的连续标注体验）
-    nxt = JM.claim(job_id, user)
-    if not nxt.get("gid"):
-        if n_labeled >= total:
-            return (gr.update(value=None),
-                    f"🎉 本作业已全部标注（{n_labeled}/{total}）",
-                    "", *([gr.Radio(value=None)] * len(CFG.features)),
-                    *(["…"] * len(bbox_feats())), *((gr.skip(),) * len(FILTER_KEYS)))
-        return _anno_idle("⚠️ " + (nxt.get("reason") or "暂无剩余可领取"))
-    st["gid"] = nxt["gid"]
-    st["partial"], st["boxes"] = {}, {}
-    cur = show_current(request)
+    st.pop("filter", None)
+    # 保存并释放 → 从**作业池**自动领下一张（多作业下就是在池子里继续随机抽）。
+    # 修正已有结果也走这里：按钮就叫「保存并释放」，只覆盖、不前进会让人以为它卡住了
+    # （实测反馈过）。「覆盖」这件事由下面的提示语讲清楚，不靠"停住"来表达。
+    _push_hist(st, gid)   # 刚处理完这张进历史：保存后「↩ 返回上一张」要能回到它
+    st.pop("gid", None)
+    cur, note = _claim_from_pool(request)
+    done = "已覆盖" if was_labeled else "已保存"
     return (cur[0],
-            f"✔ 已保存「{rec['gather_id']}」× {len(aug_recs)} 张增强图 | 作业进度 "
-            f"{n_labeled}/{total} | 已自动领取下一张",
+            f"✔ {done}「{rec['gather_id']}」"
+            + ("的原结果" if was_labeled else "")
+            + f" × {len(aug_recs)} 张增强图（后台生成中，可继续下一张） | "
+            f"本作业 {n_labeled}/{total} | {note}",
             cur[2], *cur[3:])
 
 
@@ -628,32 +779,26 @@ def release_current(request: gr.Request):
     st.pop("boxes", None)
     return (gr.update(value=None), "已归还当前道集（回池，可被他人领取）", "",
             *([gr.Radio(value=None)] * len(CFG.features)), *(["…"] * len(bbox_feats())),
-            *((gr.skip(),) * len(FILTER_KEYS)))
+            *((gr.skip(),) * len(FILTER_KEYS)), _my_total_text(user))
 
 
 def skip_current(request: gr.Request):
-    """「跳过此张」：当前道集放回池（不写记录、不计完成），并自动领取下一张。"""
+    """「跳过此张」：当前道集放回池（不写记录、不计完成），再从作业池随机领下一张。
+
+    注意是「先只放回、再从**整个池子**抽」—— 若沿用单作业的 skip（放回后只在原作业里抽），
+    多选作业时就抽不到别的作业了。
+    """
     user = _user(request)
     st = wstate(user)
     if not st.get("job_id") or not st.get("gid"):
         return _anno_idle("⚠️ 没有正在标注的道集")
-    job_id = st["job_id"]
-    out = JM.skip(job_id, user)
-    if out.get("gid"):
-        st["gid"] = out["gid"]
-        st["partial"], st["boxes"] = {}, {}
-        cur = show_current(request)
-        skipped = out.get("skipped")
-        return (cur[0],
-                f"⏭ 已跳过「{skipped or '当前道集'}」回池（未保存）｜自动领取下一张",
-                cur[2], *cur[3:])
-    n_labeled, total = JM.progress(job_id)
-    if n_labeled >= total:
-        return (gr.update(value=None),
-                f"🎉 本作业已全部标注（{n_labeled}/{total}）",
-                "", *([gr.Radio(value=None)] * len(CFG.features)),
-                *(["…"] * len(bbox_feats())))
-    return _anno_idle("⚠️ " + (out.get("reason") or "暂无剩余可领取"))
+    skipped = JM.skip_release(st["job_id"], user)
+    for k in ("gid", "job_id", "partial", "boxes", "filter"):
+        st.pop(k, None)
+    cur, note = _claim_from_pool(request)
+    return (cur[0],
+            f"⏭ 已跳过「{skipped or '当前道集'}」回池（未保存）｜{note}",
+            cur[2], *cur[3:])
 
 
 def refresh_jobs_progress():
@@ -662,17 +807,26 @@ def refresh_jobs_progress():
     顺带清理“删除确认”超时态：约 3 秒未再点则自动复原按钮/提示。
     """
     html = jobs_progress_html(JM.list_jobs())
+    staff = staff_counts_html(_staff_rows())          # 各用户标注总量表（仅管理员可见）
     if _PENDING_DELETE["job_id"] and time.time() - _PENDING_DELETE["at"] > 3.0:
         _cancel_delete()
-        return (html, gr.update(value="🗑 删除作业"), gr.update(value=""))
-    return (html, gr.update(), gr.update())
+        return (html, gr.update(value="🗑 删除作业"), gr.update(value=""), staff)
+    return (html, gr.update(), gr.update(), staff)
 
 
-def reopen_mine(request: gr.Request, job_id: str, gid: str):
+def reopen_mine(request: gr.Request, job_ids, gid: str):
     user = _user(request)
     st = wstate(user)
-    if not job_id or not gid:
+    job_ids = _norm_job_ids(job_ids)
+    if not job_ids or not gid:
         return _anno_idle("⚠️ 请选择要重开的记录")
+    # 该 gid 属于选中作业里的哪一个（同文件建的两个作业会有相同 gid → 取第一个）
+    job_id = _job_of_gid(user, gid, job_ids)
+    if job_id is None:
+        # 没标过就不是「我标注的」；admin 允许直接按当前选中的第一个作业打开
+        if not _is_admin(user):
+            return _anno_idle("⚠️ 只能重开自己标注过的记录")
+        job_id = job_ids[0]
     # 服务端校验：标注者只能重开自己标过的记录；admin 可重开任意记录
     if not _is_admin(user):
         try:
@@ -681,20 +835,77 @@ def reopen_mine(request: gr.Request, job_id: str, gid: str):
             mine_ids = set()
         if gid not in mine_ids:
             return _anno_idle("⚠️ 只能重开自己标注过的记录")
-    st["job_id"] = job_id
-    st["gid"] = gid
+    st["job_ids"] = job_ids
+    _visit(st, job_id, gid)   # 原来那张进浏览历史：重开别的记录后还能「↩ 返回上一张」
     st.pop("partial", None)   # 回退到已存记录标签
     st.pop("boxes", None)     # 回退到已存记录框
     JM.renew(job_id, user)
     return show_current(request)
 
 
+def back_previous(request: gr.Request):
+    """「↩ 返回上一张」：退回上一个访问过的道集，改完点保存即覆盖原结果。
+
+    历史取 st['hist']（浏览栈），不是「我标注的」列表顺序 —— 那张表按**首次标注时间**
+    排序，修正保存不会把记录挪到末尾，靠它会翻到别处（详见 web_core.prev_gid）。
+    到最早一张仍点 → 明确提示，不静默原地不动。
+    """
+    user = _user(request)
+    st = wstate(user)
+    if not st.get("job_id"):
+        return _anno_idle("⚠️ 请先选择作业")
+    # 手上这张还没保存。最常见的场景恰恰是：刚保存完一张、程序自动领到下一张就想回去改
+    # —— 这时它一个字都没填，直接**归还回池**再往回走，否则按钮在最常用的场景里等于摆设。
+    # 已经作答过的（选项或框）才拦下来问一句，避免把真实工作静默丢掉。
+    released = None
+    if st.get("gid") and JM.record(st.get("job_id") or "", st["gid"]) is None:
+        if _has_unsaved_input(st):
+            cur = show_current(request)
+            return (cur[0],
+                    f"⚠️ 正在标注「{st['gid']}」且已作答（尚未保存）。要返回上一张，请先点"
+                    "「保存并释放」完成本张；要放弃本张，请先点「归还此张」。",
+                    cur[2], *cur[3:])
+        released = st["gid"]
+        JM.release(st["job_id"], user)
+        st.pop("gid", None)
+    target, hist = prev_gid(st.get("hist"), st.get("gid"))
+    if not target:
+        cur = show_current(request)
+        return (cur[0], "↩ 已是最早一张，没有更早的记录可回了", cur[2], *cur[3:])
+    job_id = _job_of_gid(user, target, _norm_job_ids(st.get("job_ids")))
+    if job_id is None:
+        # 历史里的道集不属于当前选中的作业（换过作业选择，或已被 admin 删除）
+        cur = show_current(request)
+        return (cur[0],
+                f"⚠️ 上一张「{target}」不在当前作业选择里，请用「我标注的」下拉打开",
+                cur[2], *cur[3:])
+    st["hist"] = hist          # 目标已出栈；当前这张**不**压回（只回退、不前进）
+    st.pop("partial", None)    # 回退到已存记录标签
+    st.pop("boxes", None)      # 回退到已存记录框
+    st.pop("filter", None)     # 滤波只对原道集生效
+    st["job_id"] = job_id
+    st["gid"] = target
+    JM.renew(job_id, user)
+    cur = show_current(request)
+    note = f"（「{released}」未作任何作答，已归还回池）" if released else ""
+    return (cur[0],
+            f"↩ 已返回「{target}」（已标注）{note}。改完点「保存并释放」即覆盖原结果。",
+            cur[2], *cur[3:])
+
+
 def inherit_previous(request: gr.Request):
-    """把本用户最近一条【已标注】记录的类别选项填充到当前道集（仅填充不保存，框不继承）。"""
+    """把本用户最近一条【已标注】记录的类别选项填充到当前道集（仅填充不保存，框不继承）。
+
+    输出里必须带上 *_box_statuses：本函数用 gr.Radio(value=…) **程序化**改选项，不产生
+    DOM change 事件，前端拿不到任何"该刷新了"的信号；框状态标记正是那个信号（写进
+    #anno_featcol 会触发前端的观察者去回读 /api/boxes）。少了它，继承完画布上的 Ctrl
+    目标还是继承前的 —— 表现成"两项都继承了「不存在」，却仍能拉出一个框"。
+    """
     user = _user(request)
     st = wstate(user)
     if not st.get("gid") or not st.get("job_id"):
-        return ("⚠️ 请先领取道集", *([gr.Radio()] * len(CFG.features)))
+        return ("⚠️ 请先领取道集", *([gr.Radio()] * len(CFG.features)),
+                *(["…"] * len(bbox_feats())))
     src = None
     for rec in reversed(JM.mine(st["job_id"], user)):
         if rec.get("gather_id") != st["gid"] and rec.get("labels"):
@@ -703,7 +914,7 @@ def inherit_previous(request: gr.Request):
     if src is None:
         cur_sel = _selection(JM.get(st["job_id"]), st["gid"], st)
         return ("⚠️ 没有可继承的已标注记录 | " + CFG.render_sentence(cur_sel),
-                *([gr.Radio()] * len(CFG.features)))
+                *([gr.Radio()] * len(CFG.features)), *box_statuses_of(request))
     by_key = src["labels"]
     sel = {f.name: by_key[f.key] for f in CFG.features if by_key.get(f.key)}
     outs = []
@@ -712,27 +923,26 @@ def inherit_previous(request: gr.Request):
         outs.append(gr.Radio(value=next((fmt_option(o) for o in f.options if o.label == want), None)))
     st["partial"] = sel
     return ("已继承最近已标注记录（" + src["gather_id"] + "）的选项；框不继承，需另行画框："
-            + CFG.render_sentence(sel), *outs)
+            + CFG.render_sentence(sel), *outs, *box_statuses_of(request))
 
 
 def refresh_page(request: gr.Request):
-    """刷新作业下拉 + 我标注的 + 当前显示。"""
+    """刷新作业多选 + 我标注的 + 当前显示。"""
     user = _user(request)
     st = wstate(user)
-    job_id = st.get("job_id")
     job_choices = _job_choices(user)
-    if job_id not in job_choices:
-        st.pop("gid", None)
-        st.pop("partial", None)
-        st.pop("boxes", None)
-        job_id = None
-    mine_choices = _mine_choices(user, job_id) if job_id else []
-    dd = gr.update(choices=job_choices, value=job_id)
-    mine = gr.update(choices=mine_choices, value=None)
+    job_ids = [j for j in _norm_job_ids(st.get("job_ids")) if j in job_choices]
+    st["job_ids"] = job_ids                     # 选中里已被删除/关闭的 → 收敛掉
+    # 当前道集所属作业已不在选择里（被取消勾选/被删）→ 清掉当前道集
+    if st.get("gid") and st.get("job_id") not in job_ids:
+        for k in ("gid", "job_id", "partial", "boxes", "filter"):
+            st.pop(k, None)
+    dd = gr.update(choices=job_choices, value=job_ids)
+    mine = gr.update(choices=_mine_choices(user, job_ids), value=None)
     if st.get("gid"):
         anno = show_current(request)
     else:
-        anno = _anno_idle("请选择作业（选中即自动领取第一张）")
+        anno = _anno_idle("请选择作业（可多选；选中即自动从作业池随机领取一张）")
     return (dd, mine, *anno)
 
 
@@ -782,7 +992,8 @@ def _del_pack(btn_label: str, info: str, user: str, mgr_value):
             gr.update(choices=_mgmt_choices(), value=mgr_value),
             gr.update(choices=_deleted_choices(), value=None),
             jobs_progress_html(JM.list_jobs()),
-            gr.update(choices=_job_choices(user), value=None))
+            gr.update(choices=_job_choices(user), value=[]),
+            staff_counts_html(_staff_rows()))
 
 
 def delete_job_click(request: gr.Request, job_id: str):
@@ -823,14 +1034,16 @@ def restore_job_click(request: gr.Request, job_id: str):
                 gr.update(choices=_mgmt_choices(), value=None),
                 gr.update(choices=_deleted_choices(), value=None),
                 jobs_progress_html(JM.list_jobs()),
-                gr.update(choices=_job_choices(user), value=None))
+                gr.update(choices=_job_choices(user), value=[]),
+                staff_counts_html(_staff_rows()))
     job_id = (job_id or "").strip()
     if not job_id:
         return ("⚠️ 请先选择要恢复的作业",
                 gr.update(choices=_mgmt_choices(), value=None),
                 gr.update(choices=_deleted_choices(), value=None),
                 jobs_progress_html(JM.list_jobs()),
-                gr.update(choices=_job_choices(user), value=None))
+                gr.update(choices=_job_choices(user), value=[]),
+                staff_counts_html(_staff_rows()))
     title = _job_title(job_id)
     try:
         JM.restore_job(job_id)
@@ -839,13 +1052,15 @@ def restore_job_click(request: gr.Request, job_id: str):
                 gr.update(choices=_mgmt_choices(), value=None),
                 gr.update(choices=_deleted_choices(), value=None),
                 jobs_progress_html(JM.list_jobs()),
-                gr.update(choices=_job_choices(user), value=None))
+                gr.update(choices=_job_choices(user), value=[]),
+                staff_counts_html(_staff_rows()))
     _cancel_delete()
     return (f"✔ 已恢复「{title}」为进行中，回到作业列表",
             gr.update(choices=_mgmt_choices(), value=None),
             gr.update(choices=_deleted_choices(), value=None),
             jobs_progress_html(JM.list_jobs()),
-            gr.update(choices=_job_choices(user), value=None))
+            gr.update(choices=_job_choices(user), value=[]),
+            staff_counts_html(_staff_rows()))
 
 
 # ----------------------------------------------------------------------
@@ -887,12 +1102,16 @@ def init_page(request: gr.Request):
     admin = _is_admin(user)
     mgr_choices = [j["job_id"] for j in JM.list_jobs()] if admin else []
     del_choices = [j["job_id"] for j in JM.deleted_jobs()] if admin else []
-    return (gr.update(choices=_job_choices(user), value=None),
+    return (gr.update(choices=_job_choices(user), value=[]),
             gr.update(visible=admin),      # 建作业区
             gr.update(visible=admin),      # 管理区
             gr.update(choices=mgr_choices, value=None),
             gr.update(value=_who_md(user)),   # 账号栏
-            gr.update(choices=del_choices, value=None))   # 已删除作业（可恢复）
+            gr.update(choices=del_choices, value=None),   # 已删除作业（可恢复）
+            # 标注量表按最新数据重渲：组件初值是**服务启动那一刻**的快照，
+            # 不刷新的话新开的页面会看到过期计数（等第一次 5 秒 tick 才修正）
+            jobs_progress_html(JM.list_jobs()),
+            _my_total_text(user))
 
 
 def _box_clear(key: str):
@@ -950,6 +1169,17 @@ ANNO_CSS = """
 .jp-done { background: #16a34a; }
 .jp-close { background: #9ca3af; }
 .jp-empty { color: var(--body-text-color-subdued); }
+
+/* 各用户标注总量表（管理区，仅管理员可见） */
+.staff-counts { width: 100%; border-collapse: collapse; font-size: 13px; margin: 6px 0; }
+.staff-counts th, .staff-counts td {
+    border-bottom: 1px solid var(--border-color-primary);
+    padding: 4px 8px; text-align: left; vertical-align: middle;
+}
+.staff-counts th { font-weight: 600; }
+.staff-counts .sc-count { text-align: right; font-variant-numeric: tabular-nums; }
+.staff-counts .sc-role { color: var(--body-text-color-subdued); }
+.staff-counts .sc-total td { font-weight: 600; border-top: 1px solid var(--border-color-primary); }
 """
 
 # 拖动框选：bbox 特征配置（key/名称/颜色），供前端注入 JS 使用
@@ -1000,11 +1230,14 @@ ANNO_JS = """
   BBOX.forEach(function(b){ KEY2COLOR[b[0]] = b[2] || '#ff0000'; KEY2NAME[b[0]] = b[1] || b[0]; });
   let boxes = {};          // key -> {x0,y0,x1,y1}，坐标 = 图片自然像素（导出图固定 512×1024）
   let targetKey = BBOX.length ? BBOX[0][0] : null;  // Ctrl+两点当前画给谁（服务端给的 target）
+  let targetNote = '';     // 目标为空时服务端给的准确说明；空串 = 什么都不画
   let pending = null;      // Ctrl 已点下第一角：{key:…, p:[nx,ny]}（自然像素）
   let hoverNat = null;     // 最近一次鼠标位置（自然像素），用于橡皮筋预览
   let grab = null;         // 当前手势 {type:move|resize, key, ...}
   let canvas = null, lastSrc = '';
   let cursor = 0;          // 当前题序号（0-based，覆盖 1..N 选择题 + 拉框项）
+  let lastSig = '';        // 上次应用的画布几何签名；未变则 place() 直接返回
+  let rafId = 0;           // requestAnimationFrame 合并用
   const MIN = 4;           // 最小边长（自然像素）
 
   function getImg(){
@@ -1044,6 +1277,7 @@ ANNO_JS = """
     im.addEventListener('pointerup', onUp);
     im.addEventListener('pointercancel', onCancel);
     im.addEventListener('pointerleave', onLeave);
+    im.addEventListener('contextmenu', onCtxMenu);   // 右键清框（并吃掉浏览器菜单）
   }
   function clamp(v, a, b2){ return Math.max(a, Math.min(b2, v)); }
   function imgRect(){
@@ -1098,17 +1332,21 @@ ANNO_JS = """
   function drawBoxHint(c){
     if (canvas.width > 60){
       var name = targetKey ? (KEY2NAME[targetKey] || targetKey) : null;
+      // 目标为空时**不要**自作主张说"已完成"：那只可能是"两项都选了不存在"或"没有当前道集"。
+      // 文案由服务端给（note），没有就不画 —— 免得在旧图上浮出一句误导性提示。
       var text = pending ? ('再 Ctrl+左键点第二角（' + (KEY2NAME[pending.key]||pending.key) + '）')
-                         : (name ? ('Ctrl+左键点两角框选：' + name) : '框选已完成（Ctrl 可重画）');
-      var col = pending ? '#f59e0b' : '#2563eb';
-      c.font = '13px sans-serif';
-      var w = c.measureText(text).width;
-      c.fillStyle = 'rgba(255,255,255,0.82)';
-      c.fillRect(6, 6, w + 12, 22);
-      c.fillStyle = col;
-      c.fillText(text, 12, 21);
-      c.strokeStyle = col; c.lineWidth = 1;
-      c.strokeRect(6.5, 6.5, w + 11, 21);
+                         : (name ? ('Ctrl+左键点两角框选：' + name) : (targetNote || ''));
+      if (text){
+        var col = pending ? '#f59e0b' : '#2563eb';
+        c.font = '13px sans-serif';
+        var w = c.measureText(text).width;
+        c.fillStyle = 'rgba(255,255,255,0.82)';
+        c.fillRect(6, 6, w + 12, 22);
+        c.fillStyle = col;
+        c.fillText(text, 12, 21);
+        c.strokeStyle = col; c.lineWidth = 1;
+        c.strokeRect(6.5, 6.5, w + 11, 21);
+      }
     }
     if (pending){
       var p = screenRect({x0:pending.p[0], y0:pending.p[1],
@@ -1134,7 +1372,16 @@ ANNO_JS = """
             x1: Math.round(clamp(Math.max(a[0], b[0]), 0, W)),
             y1: Math.round(clamp(Math.max(a[1], b[1]), 0, H))};
   }
-  function place(){
+  // 同一帧内多次请求只做一次：避免滚动时在一帧里反复重排
+  function raf(fn){
+    if (rafId) return;
+    rafId = requestAnimationFrame(function(){ rafId = 0; fn(); });
+  }
+  function rectSig(a, b){
+    return [a.left - b.left, a.top - b.top, a.width, a.height]
+             .map(function(v){ return Math.round(v); }).join(',');
+  }
+  function place(force){
     var w = document.querySelector('#anno_imgcol .image-container');
     var img = getImg();
     canvas = ensureCanvas();
@@ -1145,33 +1392,62 @@ ANNO_JS = """
       lastSrc = img.currentSrc;
       boxes = {}; grab = null; pending = null; hoverNat = null;
       cursor = firstUnansweredIndex(items());   // 光标回到第一道未答题
+      lastSig = '';                             // 换了图 → 强制重排一次
       fetchBoxes();
+      paintCursor(false);
     }
-    paintCursor();
     var cr = w.getBoundingClientRect(), ir = img.getBoundingClientRect();
+    var sig = rectSig(ir, cr) + '|' + (canvas._img === img ? 1 : 0);
+    // 几何没变就**什么都不做**。canvas 与 img 同在一个 position:relative 容器里，
+    // 页面滚动时两者一起移动、相对位置不变 —— 原来每次 scroll 都重排 + 重设
+    // canvas.width（会重建画布缓冲、清空内容）+ 全量重绘，正是滚动卡顿的主因。
+    if (!force && sig === lastSig) return;
+    lastSig = sig;
+    var w2 = Math.round(ir.width), h2 = Math.round(ir.height);
     canvas.style.display = '';
     canvas.style.left = (ir.left - cr.left) + 'px';
     canvas.style.top  = (ir.top  - cr.top)  + 'px';
-    canvas.style.width  = Math.round(ir.width)  + 'px';
-    canvas.style.height = Math.round(ir.height) + 'px';
-    canvas.width  = Math.round(ir.width);
-    canvas.height = Math.round(ir.height);
+    canvas.style.width  = w2 + 'px';
+    canvas.style.height = h2 + 'px';
+    if (canvas.width !== w2) canvas.width = w2;      // 赋同值也会清空画布，必须判一下
+    if (canvas.height !== h2) canvas.height = h2;
     canvas._img = img; canvas._rect = ir;
     redraw();
   }
   function fetchBoxes(){
     var u = currentUser(); if (!u) return;
     fetch('/api/boxes?user=' + encodeURIComponent(u), {headers:{'Accept':'application/json'}})
-      .then(function(r){ return r.ok ? r.json() : {boxes:{}, target:null}; })
+      .then(function(r){ return r.ok ? r.json() : {boxes:{}, target:null, note:''}; })
       .then(function(d){
         if (!d) return;
-        boxes = d.boxes || {};
-        // 目标特征由服务端按「第一个需框未框」算（web_core.box_target），前端不猜 DOM
+        // 正在拖动/缩放时**不替换 boxes**：那会把手上这个框打回服务端的旧值。
+        // 目标和提示仍照常更新（它们不碰几何，不影响手势）。
+        if (!grab) boxes = d.boxes || {};
+        // 目标特征由服务端按「第一个需框未框」算（web_core.box_target），前端不猜 DOM；
+        // note 是「目标为空」时服务端给的说明（如"两项均选不存在"），空串则不画提示
         targetKey = d.target !== undefined ? d.target : targetKey;
+        targetNote = d.note || '';
         if (pending && pending.key !== targetKey) pending = null;
         if (!grab) redraw();
       })
       .catch(function(){});
+  }
+  // 去抖地回读一次 Ctrl 目标。触发点必须是**服务端 outputs 落到 DOM 之后**。
+  //
+  // 这个顺序曾经是错的：原来只在 document 的 change 监听里 fetchBoxes()，而那个监听
+  // 比 Gradio 的 on_radio_change（写 st['partial'] 的那个）**先跑**，读到的还是改之前
+  // 的选项；等服务端跑完，on_radio_change 的 outputs 里没有图片，place() 不触发，
+  // 于是**再没人回读** —— target/note 永久慢一拍。表现就是：
+  //   ① 两个都选「不存在」了，画布仍提示「框选：近炮点强能量噪声」→ 还能拉出一个框；
+  //   ② 把面波改回「存在」，画布反而提示「两项均选「不存在」，本张无需画框」→ 框不出来。
+  // 「⧉ 继承最近已标注」更彻底：它用 gr.Radio(value=…) 程序化改选项，压根不产生 DOM
+  // change 事件，所以继承完画布目标从没刷新过。
+  // 现在改为挂在 featcol 的 MutationObserver 上（服务端 outputs 就是写进这个列的），
+  // 它触发时 st['partial'] 一定已经更新，读到的就是新状态。
+  let refreshTimer = 0;
+  function scheduleTargetRefresh(){
+    if (refreshTimer) return;                       // 同一批变更只问一次
+    refreshTimer = setTimeout(function(){ refreshTimer = 0; fetchBoxes(); }, 60);
   }
   function localPt(e){
     var r = imgRect();
@@ -1195,10 +1471,22 @@ ANNO_JS = """
     return null;
   }
   // ---- 交互（全部以图片局部坐标运算，与绘制同系）----
+  // 框够大吗：太小的（Ctrl 手抖/点两下没动）不算框，挡在 MIN 这一关
+  function bigEnough(b){ return !!b && (b.x1 - b.x0) >= MIN && (b.y1 - b.y0) >= MIN; }
+  // 成框并提交：Ctrl 第二点、松开 Ctrl 两处共用同一份实现
+  function commitBox(key, b){
+    boxes[key] = b;
+    postBox(key, b);
+    fetchBoxes();                                   // 目标顺延到下一个需框特征
+  }
   function onDown(e){
     if (!canvas || !canvas._img) return;
+    // 只处理主键：右键走 contextmenu（见 onCtxMenu），中键不参与手势。
+    // 不在这儿拦住的话，右键落在已有框上会被 hitTest 命中、白白启动一次"拖动"并捕获指针。
+    if (e.button) return;
     var lp = localPt(e); if (!lp) return;
     var nat = localToNat(lp.x, lp.y); if (!nat) return;
+    hoverNat = nat;                                 // 松开 Ctrl 成框时要用「最近一次鼠标位置」
     // 一律吃掉默认行为：否则在 <img> 上按住左键会启动浏览器**原生图片拖拽**，
     // 手势被浏览器接管 → 框既拖不动也缩不了（拖动/缩放曾经"失灵"就是这个原因）。
     e.preventDefault(); e.stopPropagation();
@@ -1207,12 +1495,8 @@ ANNO_JS = """
       if (!targetKey) return;                       // 无 bbox 特征可框（或都「不存在」）
       if (pending && pending.key === targetKey){    // 第二角 → 成框并提交
         var b = rectFrom(pending.p, nat);
-        pending = null;
-        if (b.x1 - b.x0 >= MIN && b.y1 - b.y0 >= MIN){
-          boxes[targetKey] = b;
-          postBox(targetKey, b);
-          fetchBoxes();                             // 目标顺延到下一个需框特征
-        }
+        pending = null;                             // 点下第二角就消费掉第一角（框太小也重来）
+        if (bigEnough(b)) commitBox(targetKey, b);
         redraw();
         return;
       }
@@ -1274,6 +1558,16 @@ ANNO_JS = """
     boxes[key] = b;
     redraw();
   }
+  // 右键清框的服务端提交：直连自定义接口，不程序化点 Gradio 按钮（右键不该依赖它的 DOM 层级）。
+  // 先取消还没到点的去抖回读：否则它可能在服务端清掉**之前**发出、把刚清掉的框又拉回来。
+  function postClear(key){
+    var u = currentUser(); if (!u) return;
+    if (refreshTimer){ clearTimeout(refreshTimer); refreshTimer = 0; }
+    fetch('/api/anno_box_clear', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({user:u, key:key})})
+      .then(function(){ fetchBoxes(); })            // 以服务端为准收尾（目标随之顺延回来）
+      .catch(function(){});
+  }
   function postBox(key, b){
     var u = currentUser(); if (!u) return;
     fetch('/api/anno_box', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -1285,7 +1579,7 @@ ANNO_JS = """
     var g = grab; grab = null;
     if (e.target && e.target.setPointerCapture){ try { e.target.releasePointerCapture(e.pointerId); } catch(_){} }
     var b = boxes[g.key];
-    var ok = b && (b.x1 - b.x0) >= MIN && (b.y1 - b.y0) >= MIN;
+    var ok = bigEnough(b);
     if (commit && ok){
       b.x0 = Math.round(b.x0); b.y0 = Math.round(b.y0);
       b.x1 = Math.round(b.x1); b.y1 = Math.round(b.y1);
@@ -1304,6 +1598,35 @@ ANNO_JS = """
     hoverNat = null;
     if (e.target && e.target.style) e.target.style.cursor = '';
     if (pending) redraw();
+  }
+  // 松开 Ctrl（Mac 上的 Cmd）→ 以**松开瞬间的鼠标位置**作第二角直接成框。
+  // 「Ctrl 再点第二角」原样保留，两条路共用 commitBox，行为完全一致。
+  function onKeyUp(e){
+    if (e.key !== 'Control' && e.key !== 'Meta' && e.key !== 'OS') return;
+    if (!pending || !targetKey || pending.key !== targetKey) return;
+    // 指针已离开图片（onLeave 清了 hoverNat）→ 不知道第二角在哪，留着第一角别瞎猜
+    var nat = hoverNat;
+    if (!nat) return;
+    var b = rectFrom(pending.p, nat);
+    // 松手时框还太小（点完没移动就松开了）→ **保留第一角**，用户仍可 Ctrl 再点第二角。
+    // 若在这里消费掉 pending，一次误松手就把第一角弄丢了。
+    if (!bigEnough(b)) return;
+    pending = null;
+    commitBox(targetKey, b);
+    redraw();
+  }
+  // 右键：清除此框。先取消还没闭合的半成品；没有半成品时，若鼠标压在某个已落定的框上
+  // 就删掉那个框（与「✕ 清除此框」同一语义）。放在 contextmenu 上而不是 pointerdown：
+  // 一是能顺手 preventDefault 掉浏览器菜单，二是不去打扰 pointer 手势状态机。
+  function onCtxMenu(e){
+    if (!canvas || !canvas._img) return;
+    e.preventDefault(); e.stopPropagation();
+    if (pending){ pending = null; redraw(); return; }
+    var lp = localPt(e); if (!lp) return;
+    var hit = hitTest(lp.x, lp.y);
+    if (!hit) return;                               // 空白处右键：什么都不做，别误删
+    clearKey(hit.key);                              // 本地立刻消失，点一下即有反馈
+    postClear(hit.key);                             // 服务端同步清掉，清完回读目标
   }
   // ---- 按钮联动：✕ 清除该特征的框 ----
   function clearKey(key){
@@ -1343,7 +1666,7 @@ ANNO_JS = """
     else if (e.code && /^Numpad[1-9]$/.test(e.code)) d = parseInt(e.code.slice(6), 10);
     if (d === null) return;
     if (handleDigit(d)) e.preventDefault();
-    else paintCursor();
+    else paintCursor(false);
   }
   // ---- 键盘：数字键答当前题并自动前移（焦点在文本框里时不拦截）----
   // 每题单独包在一个 id=q-<key> 的容器里（见 build_app），据此**按 id 确定性分组**。
@@ -1433,8 +1756,10 @@ ANNO_JS = """
     if (cursor > its.length - 1) cursor = its.length - 1;
     return cursor;
   }
-  // 高亮当前题（"2. 异常振幅"整块发光）+ 置灰可跳过的拉框项，并把当前题滚进视野
-  function paintCursor(){
+  // 高亮当前题（"2. 异常振幅"整块发光）+ 置灰可跳过的拉框项。
+  // scrollIntoView 只在**用户主动移动光标**时做：否则每次重绘都滚一次，
+  // 会跟用户自己的滚动"抢方向盘"（滚动时被拽回当前题，看起来就是卡顿）。
+  function paintCursor(scrollIntoView){
     var its = items(); clampCursor(its);
     for (var i = 0; i < its.length; i++){
       var el = itemEl(its[i]);
@@ -1444,6 +1769,7 @@ ANNO_JS = """
       if (skippable(its[i])) el.classList.add('anno-skip');
       else el.classList.remove('anno-skip');
     }
+    if (!scrollIntoView) return;
     var cur = its[cursor] ? itemEl(its[cursor]) : null;
     if (cur && cur.scrollIntoView) cur.scrollIntoView({block:'nearest'});
   }
@@ -1462,13 +1788,13 @@ ANNO_JS = """
     if (!optionByDigit(it.group, d)) return false;
     // 先落选项再算下一题：选「不存在」后，本题对应的拉框项这一步就会被跳过
     cursor = nextIndex(its, cursor, 1);
-    paintCursor();
+    paintCursor(true);
     return true;
   }
   function moveCursor(delta){
     var its = items();
     cursor = nextIndex(its, clampCursor(its), delta > 0 ? 1 : -1);
-    paintCursor();
+    paintCursor(true);
     return cursor;
   }
   // Enter = 点「保存并释放」。elem_id 可能落在包一层的 div 上，也可能直接落在 <button> 上；
@@ -1503,6 +1829,8 @@ ANNO_JS = """
       if (e.target && e.target.closest && e.target.closest('#anno_imgcol')) e.preventDefault();
     }, true);
     document.addEventListener('keydown', onKeydown, true);
+    // 松开 Ctrl 也能定第二角（见 onKeyUp）。用捕获阶段，免得被别的组件先 stopPropagation。
+    document.addEventListener('keyup', onKeyUp, true);
     // 鼠标点选某一题 → 光标跟过去（方便接着用键盘往下答）
     document.addEventListener('change', function(e){
       var t = e.target;
@@ -1511,21 +1839,41 @@ ANNO_JS = """
       for (var i = 0; i < its.length; i++){
         if (its[i].kind === 'radio' && its[i].group.indexOf(t) >= 0){ cursor = i; break; }
       }
-      paintCursor();
-      fetchBoxes();     // 选「不存在」会让 Ctrl 目标顺延，重新问服务端
+      paintCursor(false);
+      // 目标刷新的触发点**不在这里**：本监听比 Gradio 的 on_radio_change 先跑，此刻
+      // 服务端 st['partial'] 还是改之前的值，问到的必然是旧 target（详见 scheduleTargetRefresh）。
+      // 交给 featcol 观察者在服务端 outputs 落地后再问。
     }, true);
-    window.addEventListener('resize', function(){ if (!grab) place(); });
-    window.addEventListener('scroll', function(){ if (!grab) place(); }, true);
+    window.addEventListener('resize', function(){ if (!grab) raf(function(){ place(); }); });
+    // 滚动：只做「几何变了才重排」的一次比对，平静滚动零开销（见 place 的签名判断）。
+    // 之前是同步 place()，每次 scroll 事件都重建画布 + 全量重绘，这是卡顿的主因之一。
+    window.addEventListener('scroll', function(){ if (!grab) raf(function(){ place(); }); }, true);
     var root = document.getElementById('anno_imgcol') || document.body;
     if (window.MutationObserver){
-      new MutationObserver(function(){ if (!grab) place(); })
-        .observe(root, {childList:true, subtree:true, attributes:true, attributeFilter:['src','class']});
+      // 图片区：只关心 img 被换掉（childList）或 src 变了；不再监听 class ——
+      // Gradio 会频繁切换 class（pending/generating/selected），之前每次都触发重排。
+      new MutationObserver(function(){ if (!grab) raf(function(){ place(); }); })
+        .observe(root, {childList:true, subtree:true, attributes:true, attributeFilter:['src']});
+      // 题目区：Gradio 重渲染会丢掉 .anno-current 高亮，只在这种结构变化时补画一次；
+      // 不再挂在 place() 里（否则滚动/定时也会连带跑一遍 DOM 查询与 class 切换）。
+      // 同一个观察者顺带做 Ctrl 目标的回读 —— 选项类 outputs（句子预览 / 框状态）就写在这列里，
+      // 它一触发就说明服务端 handler 已经跑完，这时读 /api/boxes 才拿得到新选项算出的 target。
+      var fcol = document.getElementById('anno_featcol');
+      if (fcol){
+        new MutationObserver(function(){
+          raf(function(){ paintCursor(false); });
+          scheduleTargetRefresh();
+        }).observe(fcol, {childList:true, subtree:true});
+      }
     }
     window.addEventListener('load', function(ev){
-      if (ev.target && ev.target.tagName === 'IMG' && ev.target.closest && ev.target.closest('#anno_imgcol')) place();
+      if (ev.target && ev.target.tagName === 'IMG' && ev.target.closest && ev.target.closest('#anno_imgcol')){
+        raf(function(){ place(); });
+      }
     }, true);
-    // 兜底：图片加载/重渲染时序不稳时，周期校正画布位置与 img 事件绑定
-    setInterval(function(){ if (!grab){ var im = getImg(); if (im) place(); } }, 900);
+    // 兜底：图片加载/重渲染时序不稳时，周期校正画布位置与 img 事件绑定。
+    // place() 已带几何签名判断，没变化时只是两次 rect 读取，不会重排/重绘。
+    setInterval(function(){ if (!grab){ var im = getImg(); if (im) raf(function(){ place(); }); } }, 900);
     place();
   }
   // 测试钩子：在 Node 里以最小 DOM 桩加载本脚本时暴露纯逻辑，便于无浏览器验证
@@ -1536,8 +1884,23 @@ ANNO_JS = """
                          rectFrom: rectFrom, isTyping: isTyping, optionText: optionText,
                          onKeydown: onKeydown, clickSave: clickSave, saveBtn: saveBtn,
                          needsBox: needsBox, skippable: skippable, nextIndex: nextIndex,
+                         onKeyUp: onKeyUp, onCtxMenu: onCtxMenu, bigEnough: bigEnough,
+                         scheduleTargetRefresh: scheduleTargetRefresh,
                          cursorIndex: function(){ return cursor; },
-                         setCursor: function(i){ cursor = i; }};
+                         setCursor: function(i){ cursor = i; },
+                         // 状态读写：Ctrl 两点/右键清框的状态机没法在 pytest 里真跑鼠标，
+                         // 靠这几个存取器把状态摆到位再直接调处理函数（同 setCursor 的思路）。
+                         pending: function(){ return pending; },
+                         setPending: function(p){ pending = p; },
+                         hoverNat: function(){ return hoverNat; },
+                         setHover: function(n){ hoverNat = n; },
+                         targetKey: function(){ return targetKey; },
+                         setTarget: function(k){ targetKey = k; },
+                         setCanvas: function(c){ canvas = c; },
+                         boxes: function(){ return boxes; },
+                         setBoxes: function(b){ boxes = b; },
+                         setGrab: function(g){ grab = g; },
+                         setup: setup};
   }
   var tries = 0;
   var iv = setInterval(function(){
@@ -1597,7 +1960,8 @@ def build_app() -> gr.Blocks:
         # ---------- ② 作业与标注（全体可见） ----------
         with gr.Accordion("② 作业与标注", open=True):
             with gr.Row():
-                job_dd = gr.Dropdown(choices=[], label="作业", scale=3)
+                job_dd = gr.Dropdown(choices=[], multiselect=True, scale=3,
+                                     label="作业（可多选：从选中的作业池里随机抽道集）")
                 btn_claim = gr.Button("领取下一张", variant="primary", scale=1)
                 btn_skip = gr.Button("⏭ 跳过此张", scale=1)
                 btn_release = gr.Button("归还此张", scale=1)
@@ -1606,6 +1970,8 @@ def build_app() -> gr.Blocks:
                 mine_dd = gr.Dropdown(choices=[], label="我标注的（选择以重开编辑）", scale=3)
                 btn_inherit = gr.Button("⧉ 继承最近已标注", scale=1)
             anno_info = gr.Markdown("请选择作业（选中即自动领取第一张）")
+            # 本用户的标注总量（跨全部作业，不区分作业）——常驻显示，随每次标注刷新
+            my_total_md = gr.Markdown(_my_total_text(_user(None) or ""))
             radios = []
             box_statuses = []
             box_buttons = []   # (feature_key, 清除按钮)
@@ -1654,29 +2020,40 @@ def build_app() -> gr.Blocks:
                                 filter_ui = {"key": feat.key,
                                              "toggle": btn_filter,
                                              "nums": (ff1, ff2, ff3, ff4)}
-            btn_save = gr.Button("保存并释放（按 Enter 下一张）", variant="primary",
-                                 elem_id="btn-save")
+            with gr.Row():
+                btn_save = gr.Button("保存并释放（按 Enter 下一张）", variant="primary",
+                                     elem_id="btn-save", scale=3)
+                # 返回上一张：连续往回翻修正已标注的记录，改完保存即覆盖原结果
+                btn_back = gr.Button("↩ 返回上一张（修正已标注的）", scale=2)
 
-        # ---------- ③ 管理（仅管理员可见） ----------
-        with gr.Accordion("③ 管理（仅管理员）", open=False, visible=False) as admin_mgr:
+        # ---------- ③ 标注量 / 作业进度（全体可见：管理员与标注者都能看） ----------
+        with gr.Accordion("③ 标注量 / 作业进度（每 5 秒自动刷新）", open=True):
+            mgr_progress = gr.HTML(jobs_progress_html(JM.list_jobs()))
+            gr.Markdown("表内「已完成 / 总数」为该作业的道集标注量；进度条按比例填充。")
+            # 定时器放在**全体可见**的这一节里：若放在仅管理员可见区，标注者那边可能不触发
+            progress_timer = gr.Timer(value=5)
+
+        # ---------- ④ 管理（仅管理员可见） ----------
+        with gr.Accordion("④ 管理（仅管理员）", open=False, visible=False) as admin_mgr:
             with gr.Row():
                 mgr_job_dd = gr.Dropdown(choices=[], label="作业", scale=3)
                 btn_resync = gr.Button("全部重传", scale=1)
                 btn_delete = gr.Button("🗑 删除作业", scale=1)
             resync_info = gr.Markdown("")
             del_info = gr.Markdown("")
-            gr.Markdown("**作业进度一览**（每 5 秒自动刷新）")
-            mgr_progress = gr.HTML(jobs_progress_html(JM.list_jobs()))
             with gr.Row():
                 del_job_dd = gr.Dropdown(choices=[], label="已删除作业（本地保留，可恢复）",
                                          scale=3)
                 btn_restore = gr.Button("♻ 恢复此作业", scale=1)
+            gr.Markdown("**各用户标注总量**（跨全部作业，每 5 秒刷新）")
+            staff_progress = gr.HTML(staff_counts_html(_staff_rows()))
             gr.Markdown("**账号管理**：编辑项目根目录 `users.yaml`（增删用户/改角色），"
                         "下一次登录即生效，无需重启服务。")
 
         # ---------------- 事件 ----------------
         demo.load(init_page, None,
-                  [job_dd, admin_build, admin_mgr, mgr_job_dd, who, del_job_dd])
+                  [job_dd, admin_build, admin_mgr, mgr_job_dd, who, del_job_dd,
+                   mgr_progress, my_total_md])
         btn_logout.click(logout_click, None, who)
 
         btn_load.click(load_file, [file_path, endian], file_info)
@@ -1688,15 +2065,19 @@ def build_app() -> gr.Blocks:
 
         # 尾部 4 个是滤波参数输入框（按作业回填，见 _filter_fields）
         filter_nums = list(filter_ui["nums"]) if filter_ui is not None else []
-        anno_outputs = [cur_img, anno_info, sentence, *radios, *box_statuses, *filter_nums]
-        job_dd.change(open_job_for, job_dd, anno_outputs + [mine_dd])
+        anno_outputs = [cur_img, anno_info, sentence, *radios, *box_statuses, *filter_nums,
+                        my_total_md]
+        job_dd.change(select_jobs, job_dd, anno_outputs + [mine_dd])
         mine_dd.change(reopen_mine, [job_dd, mine_dd], anno_outputs)
         btn_claim.click(claim_next, job_dd, anno_outputs)
         btn_skip.click(skip_current, None, anno_outputs)
         btn_release.click(release_current, None, anno_outputs)
         btn_refresh.click(refresh_page, None, [job_dd, mine_dd, *anno_outputs])
         btn_save.click(save_anno, radios, anno_outputs)
-        btn_inherit.click(inherit_previous, None, [sentence, *radios])
+        btn_back.click(back_previous, None, anno_outputs)
+        # outputs 带上框状态：继承是程序化改选项，框状态标记是前端唯一能拿到的"该刷新了"信号
+        # （详见 inherit_previous 的 docstring）
+        btn_inherit.click(inherit_previous, None, [sentence, *radios, *box_statuses])
 
         for r in radios:
             # 连同框状态一起刷新：Ctrl 目标取决于选项（选「不存在」就不需要框）
@@ -1712,14 +2093,16 @@ def build_app() -> gr.Blocks:
         btn_resync.click(resync_job, mgr_job_dd, resync_info)
         btn_delete.click(delete_job_click, mgr_job_dd,
                          [btn_delete, del_info, mgr_job_dd, del_job_dd,
-                          mgr_progress, job_dd])
+                          mgr_progress, job_dd, staff_progress])
         btn_restore.click(restore_job_click, del_job_dd,
-                          [del_info, mgr_job_dd, del_job_dd, mgr_progress, job_dd])
+                          [del_info, mgr_job_dd, del_job_dd, mgr_progress, job_dd,
+                           staff_progress])
 
-        # 管理区作业进度/删除确认：每 5 秒自动刷新（表仅放在 admin 可见的管理区）
-        gr.Timer(value=5).tick(refresh_jobs_progress,
-                               outputs=[mgr_progress, btn_delete, del_info],
-                               api_name=False, show_progress="hidden")
+        # 标注量/作业进度：每 5 秒自动刷新（③ 区全体可见，因此标注者也能看到最新标注量）；
+        # 顺带刷新管理区的删除确认按钮/提示（对标注者是不可见的组件，更新无副作用）
+        progress_timer.tick(refresh_jobs_progress,
+                            outputs=[mgr_progress, btn_delete, del_info, staff_progress],
+                            api_name=False, show_progress="hidden")
     demo.queue(default_concurrency_limit=16)
     return demo
 
@@ -1755,6 +2138,19 @@ def main():
                                      float(p.get("x1")), float(p.get("y1")))
         except Exception as e:                       # noqa: BLE001 —— 统一转 400 提示
             return JSONResponse({"ok": False, "err": str(e)}, status_code=400)
+        return {"ok": ok, "msg": msg}
+
+    @app.post("/api/anno_box_clear")
+    async def anno_box_clear(req: Request):
+        """右键清框：直接清服务端该特征的框，不依赖 Gradio 按钮的 DOM。"""
+        try:
+            p = await req.json()
+        except Exception:
+            return JSONResponse({"ok": False, "err": "bad json"}, status_code=400)
+        user = str(p.get("user") or "").strip()
+        if not user or ACC.role(user) is None:
+            return JSONResponse({"ok": False, "err": "unknown user"}, status_code=401)
+        ok, msg = clear_drag_box(user, str(p.get("key") or ""))
         return {"ok": ok, "msg": msg}
 
     @app.get("/api/boxes")
