@@ -236,10 +236,12 @@ class TestJobAndManager(unittest.TestCase):
         selection = {f.name: "存在" for f in CFG.features}
         regions, errs = finalize_regions(CFG, selection, {})
         self.assertTrue(any("面波" in e for e in errs))   # bbox 特征缺框
+        selection["异常振幅"] = "不存在"
         selection["面波"] = "不存在"
         selection["近炮点强能量噪声"] = "不存在"
         regions, errs = finalize_regions(CFG, selection, {})
         self.assertEqual(errs, [])
+        self.assertIsNone(regions["abnormal_amplitude"])
         self.assertIsNone(regions["surface_wave"])
         self.assertIsNone(regions["near_shot_noise"])
 

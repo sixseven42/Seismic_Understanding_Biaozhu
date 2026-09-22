@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""标签配置回归：v3.7 删除「静校正 / 直达波 / 50Hz工业噪声」三个特征。"""
+"""标签配置与框选顺序回归。"""
 import os
 import sys
 import unittest
@@ -29,17 +29,19 @@ class TestRemovedFeatures(unittest.TestCase):
             self.assertNotIn(n, names)
 
     def test_remaining_features_order(self):
-        # v3.8：带框特征排最后（键盘先答完选择题，再鼠标 Ctrl 框选）
         self.assertEqual([f.key for f in CFG.features],
-                         ["gather_type", "abnormal_amplitude", "aliasing_noise",
-                          "surface_wave", "near_shot_noise"])
+                         ["gather_type", "abnormal_amplitude", "noise_type",
+                          "denoise_quality", "aliasing_noise", "surface_wave",
+                          "near_shot_noise"])
+
+    def test_gather_type_only_keeps_shot_and_residual(self):
+        gather = next(f for f in CFG.features if f.key == "gather_type")
+        self.assertEqual([o.label for o in gather.options], ["炮集", "残差"])
 
     def test_bbox_features_are_last(self):
         """带框特征必须连续排在末尾 —— 界面/键盘顺序即标签顺序，先选择题后框选。"""
-        flags = [f.bbox for f in CFG.features]
-        first_box = flags.index(True)
-        self.assertTrue(all(flags[first_box:]), flags)
-        self.assertTrue(all(not f for f in flags[:first_box]), flags)
+        self.assertEqual([f.key for f in CFG.features if f.bbox],
+                         ["abnormal_amplitude", "surface_wave", "near_shot_noise"])
 
 
 class TestSentenceTemplate(unittest.TestCase):
@@ -69,9 +71,27 @@ class TestBBoxFeatures(unittest.TestCase):
         self.assertTrue(sw.bbox)
         self.assertTrue(sw.bbox_color)
 
-    def test_bbox_features_are_surface_wave_and_near_shot(self):
+    def test_bbox_features_include_abnormal_before_surface_wave(self):
         self.assertEqual([f.key for f in CFG.features if f.bbox],
-                         ["surface_wave", "near_shot_noise"])
+                         ["abnormal_amplitude", "surface_wave", "near_shot_noise"])
+        self.assertEqual(next(f for f in CFG.features if f.key == "abnormal_amplitude").region_shape,
+                         "rectangle")
+        self.assertEqual([next(f for f in CFG.features if f.key == k).region_shape
+                          for k in ("surface_wave", "near_shot_noise")],
+                         ["polygon", "polygon"])
+
+    def test_residual_conditional_features_and_multiselect(self):
+        sel = {"集合类型": "残差", "噪声类型": ["异常振幅", "混叠噪声"],
+               "去噪质量": ["噪声残留", "信号泄露"]}
+        self.assertEqual(CFG.validate_selection(sel), [])
+        self.assertEqual(set(CFG.to_record_labels(sel)),
+                         {"gather_type", "noise_type", "denoise_quality"})
+        self.assertIn("噪声类型异常振幅、混叠噪声", CFG.render_sentence(sel))
+
+    def test_denoise_completed_is_exclusive(self):
+        sel = {"集合类型": "残差", "噪声类型": ["面波"],
+               "去噪质量": ["噪声残留", "去噪完成"]}
+        self.assertTrue(CFG.validate_selection(sel))
 
     def test_validate_selection_ignores_legacy_keys(self):
         """旧记录里残留的 statics/direct_wave/industrial_50hz 不参与校验（向后兼容）。"""
@@ -82,7 +102,8 @@ class TestBBoxFeatures(unittest.TestCase):
     def test_to_record_labels_only_current_keys(self):
         sel = {f.name: f.options[0].label for f in CFG.features}
         rec = CFG.to_record_labels(sel)
-        self.assertEqual(set(rec), {f.key for f in CFG.features})
+        self.assertEqual(set(rec), {"gather_type", "abnormal_amplitude", "aliasing_noise",
+                                    "surface_wave", "near_shot_noise"})
         for k in TestRemovedFeatures.REMOVED_KEYS:
             self.assertNotIn(k, rec)
 

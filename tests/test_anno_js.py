@@ -58,14 +58,14 @@ function mkGroup(key, texts, checkedIdx){
   return {inputs: inputs, container: container};
 }
 var SCROLLED = [];
-// 题序：5 道选择题 + 2 个拉框项（与界面编号 1..7 一致）
-var MG = [mkGroup('gather_type', ['1 炮集', '2 CMP道集', '3 共检波点道集', '4 残差'], -1),
+// 题序：4 道选择题 + 3 个拉框项（与界面编号 1..7 一致）
+var MG = [mkGroup('gather_type', ['1 炮集', '2 残差'], -1),
           mkGroup('abnormal_amplitude', ['1 存在', '2 不存在', '3 已压制但有残留'], -1),
-          mkGroup('aliasing_noise', ['1 存在', '2 不存在', '3 已压制但有残留'], -1),
           mkGroup('surface_wave', ['1 存在', '2 不存在', '3 已压制但有残留'], -1),
           mkGroup('near_shot_noise', ['1 存在', '2 不存在', '3 已压制但有残留'], -1)];
 var G1 = MG[0].inputs, G2 = MG[1].inputs;
-var SECS = [{id:'bx-surface_wave', classList: mkClassList(), scrollIntoView: function(){}},
+var SECS = [{id:'bx-abnormal_amplitude', classList: mkClassList(), scrollIntoView: function(){}},
+            {id:'bx-surface_wave', classList: mkClassList(), scrollIntoView: function(){}},
             {id:'bx-near_shot_noise', classList: mkClassList(), scrollIntoView: function(){}}];
 // 保存按钮桩：记录被点了几次
 var SAVED = 0;
@@ -150,6 +150,8 @@ BY_ID['who_md'] = {querySelector: function(sel){
 
 // 「✕ 清除此框」按钮桩：右键清框会程序化点它
 var CB_CLICKS = [];
+BY_ID['cb-abnormal_amplitude'] = {tagName: 'BUTTON', id: 'cb-abnormal_amplitude',
+                                  click: function(){ CB_CLICKS.push('abnormal_amplitude'); }};
 BY_ID['cb-surface_wave'] = {tagName: 'BUTTON', id: 'cb-surface_wave',
                             click: function(){ CB_CLICKS.push('surface_wave'); }};
 BY_ID['cb-near_shot_noise'] = {tagName: 'BUTTON', id: 'cb-near_shot_noise',
@@ -165,15 +167,16 @@ function ok(cond, msg){ if (!cond){ console.error('FAIL: ' + msg); process.exit(
 
 ok(T && typeof T.handleDigit === 'function', '测试钩子未暴露');
 
-// ---- 1. 题序 = 5 道选择题 + 2 个拉框项，共 7 ----
+// ---- 1. 题序 = 4 道选择题 + 3 个拉框项，共 7 ----
 // 注意 radio 无 name：分组必须按 #q-<key>，否则会把每个选项当成一题
 // （= 方向键在同一题内跳选项的那个 bug）。
 ok(T.items().length === 7, '应有 7 个题项（按题分组），实际 ' + T.items().length);
-ok(T.items()[0].kind === 'radio' && T.items()[0].group.length === 4,
-   '第 1 题应是 4 个选项的一组，实际 ' + T.items()[0].group.length);
+ok(T.items()[0].kind === 'radio' && T.items()[0].group.length === 2,
+   '第 1 题应只有炮集和残差两个选项，实际 ' + T.items()[0].group.length);
 ok(T.items()[1].group.length === 3, '第 2 题应是 3 个选项的一组');
-ok(T.items()[5].kind === 'box' && T.items()[5].key === 'surface_wave'
-   && T.items()[6].key === 'near_shot_noise', '拉框项应排在最后两项');
+ok(T.items()[4].kind === 'box' && T.items()[4].key === 'abnormal_amplitude'
+   && T.items()[5].key === 'surface_wave' && T.items()[6].key === 'near_shot_noise',
+   '拉框项应按异常振幅→面波→近炮点顺序排列');
 
 // ---- 2. 初始光标在第 1 题并高亮 ----
 ok(T.cursorIndex() === 0, '初始光标应在第 1 题，实际 ' + T.cursorIndex());
@@ -199,12 +202,12 @@ T.moveCursor(-1); T.moveCursor(-1);
 ok(T.cursorIndex() === 0, '↑ 到顶应夹在第 1 题，实际 ' + T.cursorIndex());
 T.setCursor(6); T.moveCursor(1);
 ok(T.cursorIndex() === 6, '↓ 到底应夹在最后一项，实际 ' + T.cursorIndex());
-ok(SECS[1].classList.has('anno-current'), '↓ 到底时高亮应在最后一个拉框项');
+ok(SECS[2].classList.has('anno-current'), '↓ 到底时高亮应在最后一个拉框项');
 
 // ---- 4. 数字键答当前题并自动跳到下一题 ----
 T.setCursor(0); T.paintCursor();
-ok(T.handleDigit(3) === true, '第 1 题应被按键选中');
-ok(CLICKS[CLICKS.length-1] === '3 共检波点道集',
+ok(T.handleDigit(2) === true, '第 1 题应被按键选中');
+ok(CLICKS[CLICKS.length-1] === '2 残差',
    '应按数字选对应选项，实际 ' + CLICKS[CLICKS.length-1]);
 ok(T.cursorIndex() === 1, '答完应自动跳到第 2 题，实际 ' + T.cursorIndex());
 ok(MG[1].container.classList.has('anno-current'), '高亮应移到第 2 题');
@@ -218,12 +221,11 @@ ok(CLICKS.length === n, '无对应选项时不应产生任何点击');
 ok(T.cursorIndex() === 1, '无对应选项时光标不应移动');
 
 // ---- 5. 一路答到拉框项；拉框项不吃数字键 ----
-ok(T.handleDigit(2) === true, '第 2 题应接着被选中');
+ok(T.handleDigit(1) === true, '第 2 题应接着被选中');
 ok(T.handleDigit(1) === true, '第 3 题');
 ok(T.handleDigit(1) === true, '第 4 题');
-ok(T.handleDigit(1) === true, '第 5 题');
-ok(T.cursorIndex() === 5, '答完第 5 题应停在第 6 项（面波拉框），实际 ' + T.cursorIndex());
-ok(!MG[4].container.classList.has('anno-current'), '离开后第 5 题不应还高亮');
+ok(T.cursorIndex() === 4, '答完第 4 题应停在第 5 项（异常振幅拉框），实际 ' + T.cursorIndex());
+ok(!MG[3].container.classList.has('anno-current'), '离开后第 4 题不应还高亮');
 var n2 = CLICKS.length;
 ok(T.handleDigit(1) === false, '拉框项不吃数字键');
 ok(CLICKS.length === n2, '拉框项上按数字键不应产生点击');
@@ -231,38 +233,48 @@ ok(CLICKS.length === n2, '拉框项上按数字键不应产生点击');
 // ---- 6. 回到第 1 题重答：覆盖原选择 ----
 T.setCursor(0);
 ok(T.handleDigit(1) === true, '回到第 1 题应可重答');
-ok(G1[0].checked && !G1[2].checked, '重答应改选到新选项上');
+ok(G1[0].checked && !G1[1].checked, '重答应改选到新选项上');
 
 // ---- 7. 选「不存在」→ 对应的拉框项自动跳过 ----
-// 题序：0 集合类型 1 异常振幅 2 混叠噪声 3 面波 4 近炮点 5 面波拉框 6 近炮点拉框
-ok(T.items()[5].key === 'surface_wave' && T.items()[6].key === 'near_shot_noise',
-   '拉框项顺序应是 面波→近炮点');
-ok(T.skippable(T.items()[5]) === false, '面波未作答时不该跳过');
+// 题序：0 集合类型 1 异常振幅 2 面波 3 近炮点 4 异常振幅拉框 5 面波拉框 6 近炮点拉框
+ok(T.items()[4].key === 'abnormal_amplitude' && T.items()[5].key === 'surface_wave'
+   && T.items()[6].key === 'near_shot_noise',
+   '拉框项顺序应是 异常振幅→面波→近炮点');
+ok(T.skippable(T.items()[4]) === false, '异常振幅选「存在」时其拉框项不应跳过');
+
+// 异常振幅选「不存在」(选项 2) → 异常振幅拉框可跳过
+T.setCursor(1);
+T.handleDigit(2);
+ok(T.skippable(T.items()[4]) === true, '异常振幅选「不存在」后其拉框项应可跳过');
 
 // 面波选「不存在」(选项 2) → 面波拉框可跳过
-T.setCursor(3);
+T.setCursor(2);
 T.handleDigit(2);
 ok(T.skippable(T.items()[5]) === true, '面波选「不存在」后其拉框项应可跳过');
-ok(T.cursorIndex() === 4, '答完面波应落到第 5 题（近炮点），实际 ' + T.cursorIndex());
+ok(T.cursorIndex() === 3, '答完面波应落到第 4 题（近炮点），实际 ' + T.cursorIndex());
 
-// 近炮点也选「不存在」(选项 2) → 两个拉框项都可跳过；前方全是可跳过的 → 光标停在原地
+// 近炮点也选「不存在」(选项 2) → 三个拉框项都可跳过；前方全是可跳过的 → 光标停在原地
 T.handleDigit(2);
 ok(T.skippable(T.items()[6]) === true, '近炮点选「不存在」后其拉框项应可跳过');
-ok(T.cursorIndex() === 4, '两个拉框都可跳过时光标应停在最后一道题，实际 ' + T.cursorIndex());
+ok(T.cursorIndex() === 3, '三个拉框都可跳过时光标应停在最后一道题，实际 ' + T.cursorIndex());
 T.moveCursor(1);
-ok(T.cursorIndex() === 4, '↓ 前方无可停留题时应原地不动，实际 ' + T.cursorIndex());
+ok(T.cursorIndex() === 3, '↓ 前方无可停留题时应原地不动，实际 ' + T.cursorIndex());
 T.paintCursor();
-ok(SECS[0].classList.has('anno-skip') && SECS[1].classList.has('anno-skip'),
+ok(SECS[0].classList.has('anno-skip') && SECS[1].classList.has('anno-skip')
+   && SECS[2].classList.has('anno-skip'),
    '被跳过的拉框项应置灰标记');
 
-// 面波改回「存在」→ 不再跳过；先把近炮点答完，再进入面波拉框
-T.setCursor(3);
+// 异常振幅、面波、近炮点依次改回「存在」→ 按配置顺序进入异常振幅拉框
+T.setCursor(1);
 T.handleDigit(1);
-ok(T.skippable(T.items()[5]) === false, '面波改选「存在」后拉框项应恢复');
-ok(T.cursorIndex() === 4, '改回「存在」后仍先到第 5 题（近炮点），实际 ' + T.cursorIndex());
+ok(T.skippable(T.items()[4]) === false, '异常振幅改选「存在」后拉框项应恢复');
+ok(T.cursorIndex() === 2, '改回「存在」后应到第 3 题（面波），实际 ' + T.cursorIndex());
 T.handleDigit(1);
-ok(T.cursorIndex() === 5, '近炮点答完应进入面波拉框，实际 ' + T.cursorIndex());
-ok(SECS[0].classList.has('anno-skip') === false, '恢复后不该再置灰');
+ok(T.cursorIndex() === 3, '面波改选「存在」后应到第 4 题（近炮点），实际 ' + T.cursorIndex());
+T.handleDigit(1);
+ok(T.cursorIndex() === 4, '近炮点答完应进入异常振幅拉框，实际 ' + T.cursorIndex());
+ok(SECS[0].classList.has('anno-skip') === false && SECS[1].classList.has('anno-skip') === false
+   && SECS[2].classList.has('anno-skip') === false, '恢复后不该再置灰');
 
 // 拉框项不被跳过时，从最后一道题往后仍能停在它上面（已在上一步验证 index 5）
 
@@ -502,9 +514,9 @@ fcol.cb(); fcol.cb(); fcol.cb();
 flushTimers();
 ok(FETCHED.length === 1, '同一批 DOM 变更只该回读一次，实际 ' + FETCHED.length);
 
-// 服务端说「两项均选不存在」→ 目标为空、提示语照原样拿到（并据此禁掉 Ctrl 画框）
+// 服务端说「所有拉框项均不存在」→ 目标为空、提示语照原样拿到（并据此禁掉 Ctrl 画框）
 FETCHED.length = 0;
-FETCH_PAYLOAD = {boxes: {}, target: null, note: '两项均选「不存在」，本张无需画框'};
+FETCH_PAYLOAD = {boxes: {}, target: null, note: '所有拉框项均选「不存在」，本张无需画框'};
 fcol.cb(); flushTimers();
 ok(T.targetKey() === null, '服务端目标为空时应落到 null（Ctrl 随后不画框）');
 

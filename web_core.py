@@ -41,6 +41,24 @@ def pixel_box_to_data(c0, c1, n_tr: int, ns: int) -> dict:
     return box
 
 
+def pixel_polygon_to_data(points, n_tr: int, ns: int) -> dict:
+    """Natural-pixel polygon -> stored polygon plus compatible bounding ranges."""
+    clean = []
+    for point in points or []:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise ValueError("包络点格式无效")
+        x = max(0.0, min(float(IMG_W - 1), float(point[0])))
+        y = max(0.0, min(float(IMG_H - 1), float(point[1])))
+        p = [int(round(x)), int(round(y))]
+        if not clean or p != clean[-1]:
+            clean.append(p)
+    if len(clean) < 3 or len({tuple(p) for p in clean}) < 3:
+        raise ValueError("不规则包络至少需要 3 个不同的点")
+    xs, ys = [p[0] for p in clean], [p[1] for p in clean]
+    bounds = pixel_box_to_data((min(xs), min(ys)), (max(xs), max(ys)), n_tr, ns)
+    return {"points": clean, **bounds}
+
+
 def parse_filter(f1, f2, f3, f4) -> tuple[dict | None, str]:
     """校验面波区「滤波」的四角频率，返回 (params, err)。
 
@@ -112,7 +130,7 @@ def box_note(feats, selection: dict, target: str | None) -> str:
     """画布提示语的兜底文案 —— 目标为空时给一句**准确**的说明，别乱说"已完成"。
 
     target 为空只可能是三种情况，含义完全不同：
-      1. 本题两个带框特征都选了「不存在」→ 根本不需要画框（不是"已完成"）；
+      1. 本题所有带框特征都选了「不存在」→ 根本不需要画框（不是"已完成"）；
       2. 特征配置里没有带框特征 → 本题不涉及框选；
       3. 没有当前道集（池子标完/未领取）→ 此时前端应**什么都不画**。
     前两种给说明，第三种返回空串（前端据此隐藏提示）。
@@ -124,12 +142,12 @@ def box_note(feats, selection: dict, target: str | None) -> str:
         return "本题不需要画框"
     sel = selection or {}
     if all(sel.get(f.name) == ABSENT_LABEL for f in feats):
-        return "两项均选「不存在」，本张无需画框"
+        return "所有拉框项均选「不存在」，本张无需画框"
     return ""
 
 
 def box_target(feats, selection: dict, boxes: dict) -> str | None:
-    """Ctrl+左键「两点定矩形」当前作用的 bbox 特征 key；当前不该画框时返回 None。
+    """Ctrl+左键当前作用的包络特征 key；当前不该标范围时返回 None。
 
     规则（依次）：
       1. 已选且非「不存在」、但还没框的 → 第一个（正常流程：答完题按顺序框）；

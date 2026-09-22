@@ -3,6 +3,7 @@ import unittest
 
 from web_core import (IMG_W, IMG_H, active_filter, box_note, box_target, fmt_option,
                       jobs_progress_html, label_of, parse_filter, pixel_box_to_data,
+                      pixel_polygon_to_data,
                       prev_gid, staff_counts_html)
 
 
@@ -40,6 +41,15 @@ class TestPixelBox(unittest.TestCase):
     def test_pixel_box_clamps_negative(self):
         box = pixel_box_to_data((-5, -5), (50, 50), 512, 1024)
         self.assertEqual(box["xyxy"], [0, 0, 50, 50])
+
+    def test_polygon_keeps_vertices_and_bounding_ranges(self):
+        region = pixel_polygon_to_data([[10, 20], [100, 30], [80, 200]], 8, 400)
+        self.assertEqual(region["points"], [[10, 20], [100, 30], [80, 200]])
+        self.assertEqual(region["xyxy"], [10, 20, 100, 200])
+
+    def test_polygon_requires_three_points(self):
+        with self.assertRaises(ValueError):
+            pixel_polygon_to_data([[10, 20], [100, 30]], 8, 400)
 
 
 class TestJobsProgressHtml(unittest.TestCase):

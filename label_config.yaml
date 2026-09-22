@@ -4,7 +4,9 @@
 #   features: 特征列表，标注界面按此顺序逐个呈现
 #     - name:    特征显示名（界面与句子模板中引用）
 #       key:     存入 JSONL 的字段名（英文，建议不改）
-#       bbox:    （可选）true 表示该特征除类别外还需标注一个矩形范围框（写入记录 regions 字段）
+#       bbox:    （可选）true 表示该特征除类别外还需标注一个多边形范围（写入 regions 字段）
+#       input:   radio（默认）或 checkbox（允许同时选多个选项）
+#       when:    （可选）条件显示，例如 {feature: 集合类型, equals: 残差}
 #       bbox_color: （可选）框在显示图上的叠加颜色，如 "#ff0000"
 #       options: 可选项列表
 #         - label:  界面上显示/存储的选项名
@@ -16,39 +18,69 @@
 # 注：v3.7 起删除「静校正」「直达波」「50Hz工业噪声」三个特征；旧 labels.jsonl 里
 #     残留的 statics/direct_wave/industrial_50hz 字段不参与校验（向后兼容），
 #     需要统一重写时跑 migrate_remove_features.py。
-# 注：v3.8 起把带框特征（面波 / 近炮点强能量噪声）排到最后 —— 界面与键盘顺序就是
-#     标签顺序，于是「先键盘一路答完选择题，再用鼠标 Ctrl 两点框选」成为自然流程。
+# 注：带框特征只对炮集启用；残差使用噪声类型/去噪质量两道条件题。
 
 features:
   - name: 集合类型
     key: gather_type
     options:
       - label: 炮集
-      - label: CMP道集
-      - label: 共检波点道集
       - label: 残差
-      - label: 其他
 
   - name: 异常振幅
     key: abnormal_amplitude
+    bbox: true
+    bbox_color: "#d73a49"          # 红实线
+    when:
+      feature: 集合类型
+      not_equals: 残差
     options:
       - label: 存在
       - label: 不存在
       - label: 已压制但有残留
+
+  - name: 噪声类型
+    key: noise_type
+    input: checkbox
+    when:
+      feature: 集合类型
+      equals: 残差
+    options:
+      - label: 异常振幅
+      - label: 混叠噪声
+      - label: 面波
+      - label: 近炮点强能量
+
+  - name: 去噪质量
+    key: denoise_quality
+    input: checkbox
+    when:
+      feature: 集合类型
+      equals: 残差
+    options:
+      - label: 噪声残留
+      - label: 信号泄露
+      - label: 去噪完成
+        exclusive: true
 
   - name: 混叠噪声
     key: aliasing_noise
+    when:
+      feature: 集合类型
+      not_equals: 残差
     options:
       - label: 存在
       - label: 不存在
       - label: 已压制但有残留
-
-  # —— 以下两个带矩形框，按要求排在最后（键盘答完后用鼠标 Ctrl 框选）——
 
   - name: 面波
     key: surface_wave
     bbox: true
+    region_shape: polygon
     bbox_color: "#1f6feb"          # 蓝实线
+    when:
+      feature: 集合类型
+      not_equals: 残差
     options:
       - label: 存在
       - label: 不存在
@@ -57,10 +89,15 @@ features:
   - name: 近炮点强能量噪声
     key: near_shot_noise
     bbox: true
+    region_shape: polygon
     bbox_color: "#b58900"          # 深黄实线
+    when:
+      feature: 集合类型
+      not_equals: 残差
     options:
       - label: 存在
       - label: 不存在
       - label: 已压制但有残留
 
 sentence_template: "这是一条{集合类型}，异常振幅{异常振幅}，混叠噪声{混叠噪声}，面波{面波}，近炮点强能量噪声{近炮点强能量噪声}。"
+sentence_template_residual: "这是一条{集合类型}，噪声类型{噪声类型}，去噪质量{去噪质量}。"

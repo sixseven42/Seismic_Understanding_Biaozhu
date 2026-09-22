@@ -188,7 +188,7 @@ class SmokeWebFilter(unittest.TestCase):
         ann, gid = self._claimed()
         pay = web_app._boxes_payload("ann1")
         self.assertEqual(set(pay), {"boxes", "target", "note"})
-        self.assertEqual(pay["target"], "surface_wave")           # 第一个需框未框
+        self.assertEqual(pay["target"], "abnormal_amplitude")     # 第一个需包络未完成
         self.assertEqual(pay["boxes"], {})
         self.assertEqual(pay["note"], "")                         # 有目标 → 不需要兜底文案
 
@@ -823,13 +823,13 @@ class SmokeBackPrevious(unittest.TestCase):
         self.assertTrue(ok, msg)
         pay = web_app._boxes_payload("ann1")
         self.assertIn("surface_wave", pay["boxes"])
-        self.assertEqual(pay["target"], "near_shot_noise", "面波框好了 → 目标顺延")
+        self.assertEqual(pay["target"], "abnormal_amplitude", "异常振幅仍是首个未完成包络")
 
         ok, msg = web_app.clear_drag_box("ann1", "surface_wave")
         self.assertTrue(ok, msg)
         pay = web_app._boxes_payload("ann1")
         self.assertNotIn("surface_wave", pay["boxes"], "已落定的框应被清掉")
-        self.assertEqual(pay["target"], "surface_wave", "清掉后目标应回到面波")
+        self.assertEqual(pay["target"], "abnormal_amplitude", "清掉后仍应先完成异常振幅")
 
     def test_clear_drag_box_rejects_unknown_key(self):
         self._claim()
@@ -1003,16 +1003,16 @@ class SmokeWebMultiUser(unittest.TestCase):
         web_app.reopen_mine(ann, [self.job.job_id], gid)
         self.assertNotIn("boxes", web_app.wstate("ann1"))
 
-        # 只改一个非 bbox 特征（集合类型→CMP道集），再保存。
+        # 只改一个非 bbox 特征（集合类型→残差），再保存。
         # 提示语是「已覆盖」（重开已有记录再保存＝修正，原地停住不自动领下一张）
         sel2 = dict(sel)
-        sel2["集合类型"] = "CMP道集"
+        sel2["集合类型"] = "残差"
         out2 = web_app.save_anno(ann, *radio_values_for(sel2))
         self.assertIn("已覆盖", out2[1])
 
         rec = web_app.JM.record(self.job.job_id, gid)
-        self.assertIsNotNone(rec["regions"].get("surface_wave"))      # 框保留
-        self.assertEqual(rec["labels"].get("gather_type"), "CMP道集")  # 非 bbox 改动生效
+        self.assertNotIn("surface_wave", rec["regions"])              # 残差分支不保存包络
+        self.assertEqual(rec["labels"].get("gather_type"), "残差")  # 非 bbox 改动生效
         self.assertEqual(rec["annotated_by"], "ann1")                 # 原标注者保留
 
 

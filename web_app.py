@@ -15,6 +15,7 @@ web_app.py — 地震道集标注器（Gradio 多用户中央服务版）
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import tempfile
 import threading
@@ -25,7 +26,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from web_core import (ABSENT_LABEL, active_filter, box_note, box_target, fmt_option,
-                      jobs_progress_html, label_of, parse_filter, pixel_box_to_data,
+                      jobs_progress_html, label_of, parse_filter, pixel_polygon_to_data,
                       prev_gid, staff_counts_html)
 from labels import LabelConfig
 from users import Accounts
@@ -33,7 +34,7 @@ from jobmanager import JobManager, JobError, N_AUG
 from cloudsync import Uploader, load_config
 from gather import parse_ranges, gather_values, ranges_label
 from segy_reader import SegyReader, SegyReadError
-from imaging import overlay_boxes
+from imaging import overlay_polygons
 
 # matplotlib 默认配置目录可能不可写，导入前指到可写目录
 os.environ.setdefault("MPLCONFIGDIR", tempfile.mkdtemp(prefix="mplcfg_"))
@@ -138,6 +139,10 @@ def bbox_feats():
     return [f for f in CFG.features if f.bbox]
 
 
+def active_bbox_feats(selection: dict):
+    return [f for f in bbox_feats() if f.active_for(selection or {})]
+
+
 def _job_choices(user: str) -> list[str]:
     """标注区作业下拉候选：admin 看全部；标注者看 open + 自己标过的。"""
     if _is_admin(user):
@@ -203,11 +208,14 @@ def _filter_fields(user: str):
     return tuple(p[k] for k in FILTER_KEYS)
 
 
-def _radio_value(job, gid: str, feat, st: dict) -> str | None:
+def _radio_value(job, gid: str, feat, st: dict):
     rec = job.store.get(gid)
     by_key = (rec.get("labels") or {}) if rec else {}
     partial = st.get("partial") or {}
-    want = by_key.get(feat.key) or partial.get(feat.name)
+    want = partial.get(feat.name) if feat.name in partial else by_key.get(feat.key)
+    if feat.input == "checkbox":
+        values = want if isinstance(want, list) else ([want] if want else [])
+        return [fmt_option(opt) for opt in feat.options if opt.label in values]
     for opt in feat.options:
         if opt.label == want:
             return fmt_option(opt)
@@ -215,7 +223,26 @@ def _radio_value(job, gid: str, feat, st: dict) -> str | None:
 
 
 def _radio_updates(job, gid: str, st: dict) -> list:
-    return [gr.Radio(value=_radio_value(job, gid, f, st)) for f in CFG.features]
+    return [gr.update(value=_radio_value(job, gid, f, st)) for f in CFG.features]
+
+
+def _selection_from_values(values) -> dict:
+    """Convert Gradio display values to configured labels and enforce exclusive choices."""
+    sel = {}
+    for feat, value in zip(CFG.features, values):
+        if not value:
+            continue
+        if feat.input == "checkbox":
+            shown = value if isinstance(value, list) else [value]
+            labels = [label_of(v) for v in shown]
+            exclusive = [o.label for o in feat.options if o.exclusive]
+            picked_exclusive = [x for x in labels if x in exclusive]
+            sel[feat.name] = picked_exclusive[-1:] if picked_exclusive else labels
+        else:
+            sel[feat.name] = label_of(value)
+    # Inactive branch values may remain in hidden browser controls; never persist them.
+    active_names = {f.name for f in CFG.active_features(sel)}
+    return {name: value for name, value in sel.items() if name in active_names}
 
 
 def _selection(job, gid: str, st: dict) -> dict:
@@ -223,7 +250,7 @@ def _selection(job, gid: str, st: dict) -> dict:
     for f in CFG.features:
         v = _radio_value(job, gid, f, st)
         if v:
-            sel[f.name] = label_of(v)
+            sel[f.name] = [label_of(x) for x in v] if isinstance(v, list) else label_of(v)
     return sel
 
 
@@ -236,6 +263,13 @@ def _current_boxes(job, gid: str, st: dict) -> dict:
     if rec:
         return dict(rec.get("regions") or {})
     return {}
+
+
+def _box_list(value) -> list[dict]:
+    """把单个区域或异常振幅的多区域统一展开，兼容旧记录格式。"""
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    return [value] if isinstance(value, dict) else []
 
 
 def render_display(request: gr.Request) -> str:
@@ -252,14 +286,19 @@ def render_display(request: gr.Request) -> str:
     base = job.display_image(gid, bandpass=active_filter(st, gid))
     overlays = []
     boxes = _current_boxes(job, gid, st)
-    for feat in bbox_feats():
-        b = boxes.get(feat.key)
-        if b:
-            overlays.append((b["xyxy"], feat.bbox_color, feat.name))
+    sel = _selection(job, gid, st)
+    for feat in active_bbox_feats(sel):
+        for b in _box_list(boxes.get(feat.key)):
+            points = b.get("points")
+            if not points and b.get("xyxy"):
+                x0, y0, x1, y1 = b["xyxy"]
+                points = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+            if points:
+                overlays.append((points, feat.bbox_color, feat.name))
     if not overlays:
         return base
     tmp = os.path.join(tempfile.mkdtemp(prefix="gather_"), "cur_boxed.png")
-    return overlay_boxes(base, overlays, tmp)
+    return overlay_polygons(base, overlays, tmp)
 
 
 def box_statuses_of(request: gr.Request) -> list[str]:
@@ -269,19 +308,27 @@ def box_statuses_of(request: gr.Request) -> list[str]:
     gid = st["gid"]
     boxes = _current_boxes(job, gid, st)
     sel = _selection(job, gid, st)
-    target = box_target(bbox_feats(), sel, boxes)
+    active = active_bbox_feats(sel)
+    target = box_target(active, sel, boxes)
     outs = []
     for feat in bbox_feats():
-        b = boxes.get(feat.key)
+        if feat not in active:
+            outs.append(f"{feat.name}：当前集合类型无需包络")
+            continue
+        raw = boxes.get(feat.key)
         if sel.get(feat.name) == ABSENT_LABEL:
             # 选了「不存在」→ 这一步直接跳过（前端同样会跳过，这里给一句明确说明）
             detail = f"已选「{ABSENT_LABEL}」，无需画框（本步自动跳过）"
-        elif b:
-            (x0, y0, x1, y1), (t0, t1), (s0, s1) = b["xyxy"], b["traces"], b["samples"]
-            detail = (f"✔ 已画框：像素[{x0},{y0},{x1},{y1}]（左上→右下），"
-                      f"道 {t0} 至 {t1}，采样 {s0} 至 {s1}")
+        elif raw:
+            regions = _box_list(raw)
+            details = []
+            for b in regions:
+                (x0, y0, x1, y1), (t0, t1), (s0, s1) = b["xyxy"], b["traces"], b["samples"]
+                n_points = len(b.get("points") or [])
+                details.append(f"[{x0},{y0},{x1},{y1}] 道 {t0} 至 {t1}，采样 {s0} 至 {s1}")
+            detail = f"✔ 已画 {len(regions)} 个包络：" + "；".join(details)
         else:
-            detail = "未画框"
+            detail = "未画包络"
         if feat.key == target and sel.get(feat.name) != ABSENT_LABEL:
             detail += "｜👉 当前 Ctrl+左键目标"
         outs.append(f"{feat.name}：{detail}")
@@ -337,7 +384,7 @@ def _anno_idle(msg: str = ""):
     标注者会以为"这张已完成的任务又发给我了"（实测反馈过的误解）。
     radio 与参数字段保持不动（与旧图一起清掉反而会让用户以为选错了张）。
     """
-    return (gr.update(value=None), msg, "", *([gr.Radio()] * len(CFG.features)),
+    return (gr.update(value=None), msg, "", *([gr.update(value=None)] * len(CFG.features)),
             *(["…"] * len(bbox_feats())), *((gr.skip(),) * len(FILTER_KEYS)),
             gr.skip())
 
@@ -560,10 +607,7 @@ def on_radio_change(request: gr.Request, *radio_values):
     if not st.get("gid") or not st.get("job_id"):
         return ("", *(["…"] * len(bbox_feats())))
     JM.renew(st["job_id"], user)
-    sel = {}
-    for feat, v in zip(CFG.features, radio_values):
-        if v:
-            sel[feat.name] = label_of(v)
+    sel = _selection_from_values(radio_values)
     st["partial"] = sel
     return (CFG.render_sentence(sel), *box_statuses_of(request))
 
@@ -638,12 +682,8 @@ def toggle_filter(request: gr.Request, f1, f2, f3, f4):
         fresh_img=True)
 
 
-def apply_drag_box(user: str, key: str, x0, y0, x1, y1) -> tuple[bool, str]:
-    """把前端 Ctrl+左键两点确定的矩形写入该用户当前道集的 boxes（真实像素 512×1024）。
-
-    由自定义接口 /api/anno_box 调用（第二点落下即提交）；拖动/缩放微调后也会再次提交。
-    保存/校验继续读 st['boxes']。
-    """
+def apply_drag_polygon(user: str, key: str, points) -> tuple[bool, str]:
+    """Store a Ctrl-click polygon envelope in natural 512x1024 image pixels."""
     if key not in [f.key for f in bbox_feats()]:
         return False, f"非框选特征: {key}"
     with WORK_LOCK:
@@ -652,12 +692,36 @@ def apply_drag_box(user: str, key: str, x0, y0, x1, y1) -> tuple[bool, str]:
             return False, "没有正在标注的道集"
         job = JM.get(st["job_id"])
         g = job.gather(st["gid"])
-    box = pixel_box_to_data((float(x0), float(y0)), (float(x1), float(y1)),
-                            g.n_traces, job.ns)
+    box = pixel_polygon_to_data(points, g.n_traces, job.ns)
     with WORK_LOCK:
         st["boxes"] = dict(st.get("boxes") or {})
         st["boxes"][key] = box
     return True, key
+
+
+def apply_drag_regions(user: str, key: str, regions) -> tuple[bool, str]:
+    """Store multiple polygon/rectangle regions for one feature."""
+    if key not in [f.key for f in bbox_feats()]:
+        return False, f"非框选特征: {key}"
+    if not isinstance(regions, list) or not regions:
+        return False, "至少需要一个包络区域"
+    with WORK_LOCK:
+        st = WORK.setdefault(user, {})
+        if not st.get("job_id") or not st.get("gid"):
+            return False, "没有正在标注的道集"
+        job = JM.get(st["job_id"])
+        g = job.gather(st["gid"])
+    boxes = [pixel_polygon_to_data(points, g.n_traces, job.ns) for points in regions]
+    with WORK_LOCK:
+        st["boxes"] = dict(st.get("boxes") or {})
+        st["boxes"][key] = boxes
+    return True, key
+
+
+def apply_drag_box(user: str, key: str, x0, y0, x1, y1) -> tuple[bool, str]:
+    """Backward-compatible rectangle endpoint used by older clients/tests."""
+    return apply_drag_polygon(user, key,
+                              [[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
 
 
 def clear_drag_box(user: str, key: str) -> tuple[bool, str]:
@@ -679,10 +743,10 @@ def clear_drag_box(user: str, key: str) -> tuple[bool, str]:
 
 
 def _boxes_payload(user: str) -> dict:
-    """当前道集各 bbox 特征的框 + Ctrl 两点框选的当前目标特征。
+    """当前道集各 bbox 特征的包络 + Ctrl 多点标注的当前目标特征。
 
     返回 {"boxes": {key: {x0,y0,x1,y1}}, "target": key|None}：
-      - boxes：自然像素 xyxy（与导出图 512×1024 同系），供前端叠加可编辑手柄；
+      - boxes：自然像素 points（与导出图 512×1024 同系），并带 xyxy 范围供兼容显示；
         优先读本会话 st['boxes']，重开已保存记录时回退到 labels 记录 regions。
       - target：由 web_core.box_target 按「第一个需框未框」规则算出（Python 侧单一实现，
         可单测；前端不必去猜 DOM 里的选项状态），前端据此决定 Ctrl 左键画给谁。
@@ -696,15 +760,23 @@ def _boxes_payload(user: str) -> dict:
             return {"boxes": boxes_out, "target": None, "note": ""}
         boxes = _current_boxes(job, st["gid"], st)
         for f in bbox_feats():
-            b = boxes.get(f.key)
-            if b and b.get("xyxy"):
-                x0, y0, x1, y1 = b["xyxy"]
-                boxes_out[f.key] = {"x0": int(x0), "y0": int(y0),
-                                    "x1": int(x1), "y1": int(y1)}
+            raw = boxes.get(f.key)
+            regions = []
+            for b in _box_list(raw):
+                if not b.get("xyxy"):
+                    continue
+                points = b.get("points")
+                if not points:
+                    x0, y0, x1, y1 = b["xyxy"]
+                    points = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+                regions.append({"points": [[int(x), int(y)] for x, y in points]})
+            if regions:
+                boxes_out[f.key] = regions if len(regions) > 1 else regions[0]
         sel = _selection(job, st["gid"], st)
-        target = box_target(bbox_feats(), sel, boxes)
-        note = box_note(bbox_feats(), sel, target)
-    # note 只在「目标为空」时有值：给前端一句准确说明（如「两项均选不存在，无需画框」）；
+        active = active_bbox_feats(sel)
+        target = box_target(active, sel, boxes)
+        note = box_note(active, sel, target)
+    # note 只在「目标为空」时有值：给前端一句准确说明（如「所有拉框项均不存在，无需画框」）；
     # 没有当前道集时为空串 → 前端**不画任何提示**（否则旧图上会浮出误导性的"已完成"）
     return {"boxes": boxes_out, "target": target, "note": note}
 
@@ -716,10 +788,7 @@ def save_anno(request: gr.Request, *radio_values):
         return _anno_idle("⚠️ 没有正在标注的道集")
     job_id = st["job_id"]
     gid = st["gid"]
-    sel = {}
-    for feat, v in zip(CFG.features, radio_values):
-        if v:
-            sel[feat.name] = label_of(v)
+    sel = _selection_from_values(radio_values)
     st["partial"] = sel
     # 保存前这张是否已有记录 → 区分「首次标注」与「修正已有结果」。两者收尾不同：
     # 首次标注保存后自动领下一张；修正保存原地停住（见下方 was_labeled 分支）。
@@ -778,7 +847,7 @@ def release_current(request: gr.Request):
     st.pop("partial", None)
     st.pop("boxes", None)
     return (gr.update(value=None), "已归还当前道集（回池，可被他人领取）", "",
-            *([gr.Radio(value=None)] * len(CFG.features)), *(["…"] * len(bbox_feats())),
+            *([gr.update(value=None)] * len(CFG.features)), *(["…"] * len(bbox_feats())),
             *((gr.skip(),) * len(FILTER_KEYS)), _my_total_text(user))
 
 
@@ -904,7 +973,7 @@ def inherit_previous(request: gr.Request):
     user = _user(request)
     st = wstate(user)
     if not st.get("gid") or not st.get("job_id"):
-        return ("⚠️ 请先领取道集", *([gr.Radio()] * len(CFG.features)),
+        return ("⚠️ 请先领取道集", *([gr.update(value=None)] * len(CFG.features)),
                 *(["…"] * len(bbox_feats())))
     src = None
     for rec in reversed(JM.mine(st["job_id"], user)):
@@ -914,13 +983,17 @@ def inherit_previous(request: gr.Request):
     if src is None:
         cur_sel = _selection(JM.get(st["job_id"]), st["gid"], st)
         return ("⚠️ 没有可继承的已标注记录 | " + CFG.render_sentence(cur_sel),
-                *([gr.Radio()] * len(CFG.features)), *box_statuses_of(request))
+                *([gr.update(value=None)] * len(CFG.features)), *box_statuses_of(request))
     by_key = src["labels"]
     sel = {f.name: by_key[f.key] for f in CFG.features if by_key.get(f.key)}
     outs = []
     for f in CFG.features:
         want = sel.get(f.name)
-        outs.append(gr.Radio(value=next((fmt_option(o) for o in f.options if o.label == want), None)))
+        if f.input == "checkbox":
+            vals = want if isinstance(want, list) else ([want] if want else [])
+            outs.append(gr.update(value=[fmt_option(o) for o in f.options if o.label in vals]))
+        else:
+            outs.append(gr.update(value=next((fmt_option(o) for o in f.options if o.label == want), None)))
     st["partial"] = sel
     return ("已继承最近已标注记录（" + src["gather_id"] + "）的选项；框不继承，需另行画框："
             + CFG.render_sentence(sel), *outs, *box_statuses_of(request))
@@ -1182,8 +1255,16 @@ ANNO_CSS = """
 .staff-counts .sc-total td { font-weight: 600; border-top: 1px solid var(--border-color-primary); }
 """
 
-# 拖动框选：bbox 特征配置（key/名称/颜色），供前端注入 JS 使用
-_DRAG_BBOX = [[f.key, f.name, f.bbox_color] for f in CFG.features if f.bbox]
+# 多点包络：bbox 特征配置（key/名称/颜色/条件），供前端注入 JS 使用
+def _when_meta(feat):
+    w = feat.when or {}
+    parent = next((x.key for x in CFG.features if x.name == w.get("feature")), "")
+    return [parent, w.get("equals", ""), w.get("not_equals", "")]
+
+
+_DRAG_BBOX = [[f.key, f.name, f.bbox_color, f.region_shape, *_when_meta(f),
+               f.key == "abnormal_amplitude"]
+              for f in CFG.features if f.bbox]
 
 
 def _absent_label(feat) -> str:
@@ -1196,7 +1277,8 @@ def _absent_label(feat) -> str:
 
 # 全部特征（键+名+「不存在」label，顺序=题号顺序）：前端据此按 #q-<key> / #bx-<key> 定位
 # 每个题项、并判断某个拉框项是否可以跳过（不依赖 Gradio 生成的 DOM 细节）
-_ANNO_FEATS = [[f.key, f.name, _absent_label(f)] for f in CFG.features]
+_ANNO_FEATS = [[f.key, f.name, _absent_label(f), f.input, *_when_meta(f),
+                [o.label for o in f.options if o.exclusive]] for f in CFG.features]
 
 ANNO_JS = """
 <style>
@@ -1226,12 +1308,13 @@ ANNO_JS = """
 (function(){
   const BBOX = __DRAG_BBOX__;
   const FEATS = __ANNO_FEATS__;     // [[key,name],...]，顺序 = 界面题号顺序（1..N）
-  const KEY2COLOR = {}, KEY2NAME = {};
-  BBOX.forEach(function(b){ KEY2COLOR[b[0]] = b[2] || '#ff0000'; KEY2NAME[b[0]] = b[1] || b[0]; });
-  let boxes = {};          // key -> {x0,y0,x1,y1}，坐标 = 图片自然像素（导出图固定 512×1024）
+  const KEY2COLOR = {}, KEY2NAME = {}, KEY2SHAPE = {}, KEY2MULTI = {};
+  BBOX.forEach(function(b){ KEY2COLOR[b[0]] = b[2] || '#ff0000'; KEY2NAME[b[0]] = b[1] || b[0]; KEY2SHAPE[b[0]] = b[3] || 'rectangle'; KEY2MULTI[b[0]] = b[7] === true || b[0] === 'abnormal_amplitude'; });
+  let boxes = {};          // key -> box 或 box[]，坐标 = 图片自然像素
   let targetKey = BBOX.length ? BBOX[0][0] : null;  // Ctrl+两点当前画给谁（服务端给的 target）
   let targetNote = '';     // 目标为空时服务端给的准确说明；空串 = 什么都不画
-  let pending = null;      // Ctrl 已点下第一角：{key:…, p:[nx,ny]}（自然像素）
+  let pending = null;      // Ctrl 连续点击中的包络：{key:…, points:[[nx,ny],...]}
+  let multiDirty = false; // 异常振幅的多个矩形尚未按空格确认
   let hoverNat = null;     // 最近一次鼠标位置（自然像素），用于橡皮筋预览
   let grab = null;         // 当前手势 {type:move|resize, key, ...}
   let canvas = null, lastSrc = '';
@@ -1295,10 +1378,20 @@ ANNO_JS = """
   function screenRect(b){                       // 自然像素 -> 局部(0..显示宽高)
     var im = (canvas && canvas._img) ? canvas._img : getImg();
     var r = imgRect(); if (!im || !r) return {x:0,y:0,w:0,h:0};
-    return {x: b.x0/im.naturalWidth*r.width,  y: b.y0/im.naturalHeight*r.height,
-            w: (b.x1-b.x0)/im.naturalWidth*r.width, h: (b.y1-b.y0)/im.naturalHeight*r.height};
+    var bb = b;
+    if (b.points && b.points.length){
+      var xs = b.points.map(function(p){return p[0];}), ys = b.points.map(function(p){return p[1];});
+      bb = {x0:Math.min.apply(null,xs), y0:Math.min.apply(null,ys),
+            x1:Math.max.apply(null,xs), y1:Math.max.apply(null,ys)};
+    }
+    return {x: bb.x0/im.naturalWidth*r.width,  y: bb.y0/im.naturalHeight*r.height,
+            w: (bb.x1-bb.x0)/im.naturalWidth*r.width, h: (bb.y1-bb.y0)/im.naturalHeight*r.height};
   }
   function copyBox(b){ return {x0:b.x0, y0:b.y0, x1:b.x1, y1:b.y1}; }
+  function boxItems(key){
+    var value = boxes[key];
+    return Array.isArray(value) ? value : (value ? [value] : []);
+  }
   function natCorner(b, which){
     switch(which){
       case 'nw': return [b.x0, b.y0];
@@ -1314,28 +1407,41 @@ ANNO_JS = """
     if (!canvas._img) return;
     var hs = Math.max(7, Math.min(14, Math.round(canvas.width * 0.02) || 9));
     for (var key in boxes){
-      var b = boxes[key]; if (!b) continue;
-      var s = screenRect(b), col = KEY2COLOR[key] || '#1f6feb';
+      var list = boxItems(key), col = KEY2COLOR[key] || '#1f6feb';
+      for (var bi = 0; bi < list.length; bi++){
+      var b = list[bi]; if (!b) continue;
+      var s = screenRect(b);
       c.strokeStyle = col;
       c.lineWidth = (grab && grab.key === key) ? 4 : 3;
-      c.strokeRect(s.x, s.y, s.w, s.h);
-      var pts = [[s.x,s.y],[s.x+s.w,s.y],[s.x,s.y+s.h],[s.x+s.w,s.y+s.h]];
+      var isRect = KEY2SHAPE[key] === 'rectangle';
+      var pts = (!isRect && b.points && b.points.length) ? b.points.map(function(p){
+        return [p[0]/canvas._img.naturalWidth*canvas.width,
+                p[1]/canvas._img.naturalHeight*canvas.height];
+      }) : [[s.x,s.y],[s.x+s.w,s.y],[s.x+s.w,s.y+s.h],[s.x,s.y+s.h]];
+      c.beginPath(); c.moveTo(pts[0][0], pts[0][1]);
+      for (var pi=1; pi<pts.length; pi++) c.lineTo(pts[pi][0], pts[pi][1]);
+      c.lineTo(pts[0][0], pts[0][1]); c.stroke();
       for (var i = 0; i < pts.length; i++){
         var px = pts[i][0], py = pts[i][1];
         c.fillStyle = col; c.fillRect(px - hs/2, py - hs/2, hs, hs);
         c.fillStyle = '#ffffff'; c.fillRect(px - hs/4, py - hs/4, hs/2, hs/2);
       }
     }
+    }
     drawBoxHint(c);
   }
-  // 画布左上角的目标提示 + Ctrl 两点框选的待定第一角/橡皮筋预览
+  // 画布左上角的目标提示 + Ctrl 多点包络的实时预览
   function drawBoxHint(c){
     if (canvas.width > 60){
       var name = targetKey ? (KEY2NAME[targetKey] || targetKey) : null;
       // 目标为空时**不要**自作主张说"已完成"：那只可能是"两项都选了不存在"或"没有当前道集"。
       // 文案由服务端给（note），没有就不画 —— 免得在旧图上浮出一句误导性提示。
-      var text = pending ? ('再 Ctrl+左键点第二角（' + (KEY2NAME[pending.key]||pending.key) + '）')
-                         : (name ? ('Ctrl+左键点两角框选：' + name) : (targetNote || ''));
+      var text = pending ? (pending.points ? ('继续 Ctrl+左键添加顶点，松开 Ctrl 完成（' + pending.points.length + ' 点）') : (KEY2MULTI[pending.key] ? 'Ctrl+左键点第二角完成一个矩形，继续添加；按空格完成' : 'Ctrl+左键点第二角后完成矩形'))
+                         : (name ? (KEY2SHAPE[targetKey] === 'rectangle'
+                                    ? (KEY2MULTI[targetKey] ? ('按住 Ctrl 点击两个角点添加矩形，按空格完成：' + name)
+                                                               : ('按住 Ctrl 点击两个角点框选：' + name))
+                                    : ('按住 Ctrl 点击多个点形成包络：' + name))
+                                 : (targetNote || ''));
       if (text){
         var col = pending ? '#f59e0b' : '#2563eb';
         c.font = '13px sans-serif';
@@ -1348,22 +1454,19 @@ ANNO_JS = """
         c.strokeRect(6.5, 6.5, w + 11, 21);
       }
     }
-    if (pending){
-      var p = screenRect({x0:pending.p[0], y0:pending.p[1],
-                          x1:pending.p[0], y1:pending.p[1]});
+    if (pending && pending.points && pending.points.length){
+      var p = screenRect({x0:pending.points[0][0], y0:pending.points[0][1],
+                          x1:pending.points[0][0], y1:pending.points[0][1]});
       var col2 = KEY2COLOR[pending.key] || '#1f6feb';
       c.strokeStyle = col2; c.lineWidth = 2;
-      c.beginPath(); c.moveTo(p.x - 9, p.y); c.lineTo(p.x + 9, p.y);
-      c.moveTo(p.x, p.y - 9); c.lineTo(p.x, p.y + 9); c.stroke();
-      if (hoverNat){
-        var s = screenRect(rectFrom(pending.p, hoverNat));
-        c.setLineDash([6, 4]);
-        c.strokeRect(s.x, s.y, s.w, s.h);
-        c.setLineDash([]);
-      }
+      c.beginPath();
+      pending.points.forEach(function(q, i){ var z=screenRect({x0:q[0],y0:q[1],x1:q[0],y1:q[1]});
+        if (i===0) c.moveTo(z.x,z.y); else c.lineTo(z.x,z.y); });
+      if (hoverNat){ var hz=screenRect({x0:hoverNat[0],y0:hoverNat[1],x1:hoverNat[0],y1:hoverNat[1]}); c.lineTo(hz.x,hz.y); }
+      c.setLineDash([6,4]); c.stroke(); c.setLineDash([]);
     }
   }
-  // 两个自然像素角点 -> 归一化、取整、夹到图内的矩形
+  // 兼容异常振幅矩形模式的两个角点换算
   function rectFrom(a, b){
     var im = getImg(); if (!im) return {x0:0, y0:0, x1:0, y1:0};
     var W = im.naturalWidth - 1, H = im.naturalHeight - 1;
@@ -1371,6 +1474,11 @@ ANNO_JS = """
             y0: Math.round(clamp(Math.min(a[1], b[1]), 0, H)),
             x1: Math.round(clamp(Math.max(a[0], b[0]), 0, W)),
             y1: Math.round(clamp(Math.max(a[1], b[1]), 0, H))};
+  }
+  function polygonFrom(points){
+    var im = getImg(); if (!im) return [];
+    var W = im.naturalWidth - 1, H = im.naturalHeight - 1;
+    return (points || []).map(function(p){ return [Math.round(clamp(p[0],0,W)), Math.round(clamp(p[1],0,H))]; });
   }
   // 同一帧内多次请求只做一次：避免滚动时在一帧里反复重排
   function raf(fn){
@@ -1390,7 +1498,7 @@ ANNO_JS = """
     bindImg(img);
     if (img.currentSrc && img.currentSrc !== lastSrc){   // 换了道集/重开 → 清本地并回填服务器
       lastSrc = img.currentSrc;
-      boxes = {}; grab = null; pending = null; hoverNat = null;
+      boxes = {}; grab = null; pending = null; hoverNat = null; multiDirty = false;
       cursor = firstUnansweredIndex(items());   // 光标回到第一道未答题
       lastSig = '';                             // 换了图 → 强制重排一次
       fetchBoxes();
@@ -1422,13 +1530,20 @@ ANNO_JS = """
         if (!d) return;
         // 正在拖动/缩放时**不替换 boxes**：那会把手上这个框打回服务端的旧值。
         // 目标和提示仍照常更新（它们不碰几何，不影响手势）。
-        if (!grab) boxes = d.boxes || {};
+        if (!grab){
+          var localMulti = (multiDirty && targetKey && KEY2MULTI[targetKey]) ? boxes[targetKey] : null;
+          boxes = d.boxes || {};
+          if (localMulti && Array.isArray(localMulti)) boxes[targetKey] = localMulti;
+        }
         // 目标特征由服务端按「第一个需框未框」算（web_core.box_target），前端不猜 DOM；
-        // note 是「目标为空」时服务端给的说明（如"两项均选不存在"），空串则不画提示
+        // note 是「目标为空」时服务端给的说明（如"所有拉框项均不存在"），空串则不画提示
         targetKey = d.target !== undefined ? d.target : targetKey;
         targetNote = d.note || '';
         if (pending && pending.key !== targetKey) pending = null;
-        if (!grab) redraw();
+        if (!grab){
+          redraw();
+          paintCursor(false);
+        }
       })
       .catch(function(){});
   }
@@ -1439,7 +1554,7 @@ ANNO_JS = """
   // 的选项；等服务端跑完，on_radio_change 的 outputs 里没有图片，place() 不触发，
   // 于是**再没人回读** —— target/note 永久慢一拍。表现就是：
   //   ① 两个都选「不存在」了，画布仍提示「框选：近炮点强能量噪声」→ 还能拉出一个框；
-  //   ② 把面波改回「存在」，画布反而提示「两项均选「不存在」，本张无需画框」→ 框不出来。
+  //   ② 把面波改回「存在」，画布反而提示「所有拉框项均选「不存在」，本张无需画框」→ 框不出来。
   // 「⧉ 继承最近已标注」更彻底：它用 gr.Radio(value=…) 程序化改选项，压根不产生 DOM
   // change 事件，所以继承完画布目标从没刷新过。
   // 现在改为挂在 featcol 的 MutationObserver 上（服务端 outputs 就是写进这个列的），
@@ -1459,25 +1574,58 @@ ANNO_JS = """
     if (!canvas || !canvas._img) return null;
     var tol = Math.max(9, Math.round(canvas.width * 0.02));
     for (var key in boxes){
-      var b = boxes[key]; if (!b) continue;
+      var list = boxItems(key);
+      for (var bi = 0; bi < list.length; bi++){
+      var b = list[bi]; if (!b) continue;
       var s = screenRect(b);
+      if (KEY2SHAPE[key] !== 'rectangle' && b.points && b.points.length){
+        if (x >= s.x && x <= s.x+s.w && y >= s.y && y <= s.y+s.h) return {type:'polygon', key:key, index:bi};
+        continue;
+      }
       var corners = {nw:[s.x,s.y], ne:[s.x+s.w,s.y], sw:[s.x,s.y+s.h], se:[s.x+s.w,s.y+s.h]};
       for (var cName in corners){
         var p = corners[cName];
-        if (Math.abs(p[0]-x) <= tol && Math.abs(p[1]-y) <= tol) return {type:'resize', key:key, corner:cName};
+        if (Math.abs(p[0]-x) <= tol && Math.abs(p[1]-y) <= tol) return {type:'resize', key:key, corner:cName, index:bi};
       }
-      if (x >= s.x && x <= s.x+s.w && y >= s.y && y <= s.y+s.h) return {type:'move', key:key};
+      if (x >= s.x && x <= s.x+s.w && y >= s.y && y <= s.y+s.h) return {type:'move', key:key, index:bi};
+      }
     }
     return null;
   }
   // ---- 交互（全部以图片局部坐标运算，与绘制同系）----
   // 框够大吗：太小的（Ctrl 手抖/点两下没动）不算框，挡在 MIN 这一关
-  function bigEnough(b){ return !!b && (b.x1 - b.x0) >= MIN && (b.y1 - b.y0) >= MIN; }
-  // 成框并提交：Ctrl 第二点、松开 Ctrl 两处共用同一份实现
-  function commitBox(key, b){
+  function bigEnough(b){
+    if (!b) return false;
+    if (b.points) return b.points.length >= 3;
+    return (b.x1 - b.x0) >= MIN && (b.y1 - b.y0) >= MIN;
+  }
+  function commitPolygon(key, points){
+    var ps = polygonFrom(points);
+    if (ps.length < 3) return;
+    var xs=ps.map(function(p){return p[0];}), ys=ps.map(function(p){return p[1];});
+    var b = {points: ps, x0:Math.min.apply(null,xs), y0:Math.min.apply(null,ys),
+             x1:Math.max.apply(null,xs), y1:Math.max.apply(null,ys)};
+    if (KEY2MULTI[key]){
+      if (!Array.isArray(boxes[key])) boxes[key] = [];
+      boxes[key].push(b);
+      multiDirty = true;
+      return;
+    }
     boxes[key] = b;
+    // 先在本地推进高亮，避免用户完成矩形后仍看到旧的包络提示。
+    advanceAfterBox(key);
+    // postBox 在服务端写入成功后才回读 /api/boxes，避免读到旧 target。
     postBox(key, b);
-    fetchBoxes();                                   // 目标顺延到下一个需框特征
+  }
+  function finishMultiRect(){
+    if (!targetKey || !KEY2MULTI[targetKey] || pending) return false;
+    var list = boxItems(targetKey);
+    if (!list.length) return false;
+    var key = targetKey;
+    postBox(key, list);
+    advanceAfterBox(key, true);
+    redraw();
+    return true;
   }
   function onDown(e){
     if (!canvas || !canvas._img) return;
@@ -1490,29 +1638,34 @@ ANNO_JS = """
     // 一律吃掉默认行为：否则在 <img> 上按住左键会启动浏览器**原生图片拖拽**，
     // 手势被浏览器接管 → 框既拖不动也缩不了（拖动/缩放曾经"失灵"就是这个原因）。
     e.preventDefault(); e.stopPropagation();
-    // ---- Ctrl（或 Mac Cmd）+左键：两点定矩形（第一角 → 第二角即确定）----
+    // ---- Ctrl（或 Mac Cmd）+左键：异常振幅两点矩形，其他特征多点包络 ----
     if (e.ctrlKey || e.metaKey){
       if (!targetKey) return;                       // 无 bbox 特征可框（或都「不存在」）
-      if (pending && pending.key === targetKey){    // 第二角 → 成框并提交
-        var b = rectFrom(pending.p, nat);
-        pending = null;                             // 点下第二角就消费掉第一角（框太小也重来）
-        if (bigEnough(b)) commitBox(targetKey, b);
-        redraw();
-        return;
+      if (pending && pending.key === targetKey && KEY2SHAPE[targetKey] === 'rectangle'){
+        var rb = rectFrom(pending.p, nat);
+        pending = null;
+        if (bigEnough(rb)) commitPolygon(targetKey, [[rb.x0,rb.y0],[rb.x1,rb.y0],[rb.x1,rb.y1],[rb.x0,rb.y1]]);
+      } else if (pending && pending.key === targetKey){
+        pending.points.push(nat);
+      } else {
+        pending = KEY2SHAPE[targetKey] === 'rectangle'
+          ? {key: targetKey, p: nat}
+          : {key: targetKey, points: [nat]};
       }
-      pending = {key: targetKey, p: nat};           // 第一角
       redraw();
       return;
     }
     // ---- 普通左键：拖动 / 拖角缩放微调已有框 ----
     var hit = hitTest(lp.x, lp.y);
     if (!hit) return;                               // 空白区点击不做任何事
+    if (hit.type === 'polygon') return;             // 多边形清除后重画，不做矩形式拖拽
     var key = hit.key;
     grab = hit;
-    grab.snapshot = boxes[key] ? copyBox(boxes[key]) : null;
+    var hitBox = boxItems(key)[hit.index || 0];
+    grab.snapshot = hitBox ? copyBox(hitBox) : null;
     if (hit.type === 'resize'){
       var opp = {nw:'se', se:'nw', ne:'sw', sw:'ne'}[hit.corner];
-      grab.anchorNat = natCorner(boxes[key], opp);   // 对角锚点（自然像素，固定）
+      grab.anchorNat = natCorner(hitBox, opp);       // 对角锚点（自然像素，固定）
     } else {
       grab.nat0 = nat;                              // 整体移动起点
     }
@@ -1530,7 +1683,7 @@ ANNO_JS = """
         return;
       }
       var h = hitTest(lp.x, lp.y);
-      var cur = h ? (h.type === 'move' ? 'move'
+      var cur = h ? (h.type === 'polygon' ? 'crosshair' : h.type === 'move' ? 'move'
                      : (h.corner === 'nw' || h.corner === 'se') ? 'nwse-resize' : 'nesw-resize')
                   : 'crosshair';
       if (e.target.style) e.target.style.cursor = cur;
@@ -1539,7 +1692,7 @@ ANNO_JS = """
     e.preventDefault();
     var nat = hoverNat; if (!nat) return;
     var g = grab, key = g.key, im = canvas._img;
-    var b = boxes[key] || {x0:0, y0:0, x1:0, y1:0};
+    var list = boxItems(key), b = list[g.index || 0] || {x0:0, y0:0, x1:0, y1:0};
     var W = im.naturalWidth - 1, H = im.naturalHeight - 1;
     if (g.type === 'move'){
       var dx = nat[0] - g.nat0[0], dy = nat[1] - g.nat0[1];
@@ -1555,7 +1708,8 @@ ANNO_JS = """
       else if (g.corner === 'ne'){ b.x1 = Math.round(clamp(nx, A[0] + MIN, W)); b.y0 = Math.round(clamp(ny, 0, A[1] - MIN)); }
       else if (g.corner === 'sw'){ b.x0 = Math.round(clamp(nx, 0, A[0] - MIN)); b.y1 = Math.round(clamp(ny, A[1] + MIN, H)); }
     }
-    boxes[key] = b;
+    if (KEY2MULTI[key]) boxes[key][g.index || 0] = b;
+    else boxes[key] = b;
     redraw();
   }
   // 右键清框的服务端提交：直连自定义接口，不程序化点 Gradio 按钮（右键不该依赖它的 DOM 层级）。
@@ -1569,24 +1723,38 @@ ANNO_JS = """
       .catch(function(){});
   }
   function postBox(key, b){
-    var u = currentUser(); if (!u) return;
-    fetch('/api/anno_box', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({user:u, key:key, x0:b.x0, y0:b.y0, x1:b.x1, y1:b.y1})})
+    var u = currentUser(); if (!u) return Promise.resolve();
+    var payload = {user:u, key:key};
+    if (KEY2MULTI[key] && Array.isArray(b)){
+      payload.regions = b.map(function(item){ return item.points; });
+    } else {
+      payload.points = Array.isArray(b) ? b : b.points;
+    }
+    return fetch('/api/anno_box', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)})
+      .then(function(){ if (KEY2MULTI[key]) multiDirty = false; fetchBoxes(); })
       .catch(function(){});
   }
   function endGesture(e, commit){
     if (!grab) return;
     var g = grab; grab = null;
     if (e.target && e.target.setPointerCapture){ try { e.target.releasePointerCapture(e.pointerId); } catch(_){} }
-    var b = boxes[g.key];
+    var b = boxItems(g.key)[g.index || 0];
     var ok = bigEnough(b);
     if (commit && ok){
       b.x0 = Math.round(b.x0); b.y0 = Math.round(b.y0);
       b.x1 = Math.round(b.x1); b.y1 = Math.round(b.y1);
-      boxes[g.key] = b;
-      postBox(g.key, b);                            // 拖动/缩放微调后同样提交
+      if (KEY2SHAPE[g.key] === 'rectangle'){
+        b.points = [[b.x0,b.y0],[b.x1,b.y0],[b.x1,b.y1],[b.x0,b.y1]];
+      }
+      if (KEY2MULTI[g.key]) boxes[g.key][g.index || 0] = b;
+      else boxes[g.key] = b;
+      postBox(g.key, KEY2MULTI[g.key] ? boxes[g.key] : b); // 拖动/缩放微调后同样提交
     } else {
-      if (g.snapshot) boxes[g.key] = g.snapshot;
+      if (g.snapshot){
+        if (KEY2MULTI[g.key]) boxes[g.key][g.index || 0] = g.snapshot;
+        else boxes[g.key] = g.snapshot;
+      } else if (KEY2MULTI[g.key]) boxes[g.key].splice(g.index || 0, 1);
       else delete boxes[g.key];
     }
     if (e.target && e.target.style) e.target.style.cursor = '';
@@ -1607,12 +1775,21 @@ ANNO_JS = """
     // 指针已离开图片（onLeave 清了 hoverNat）→ 不知道第二角在哪，留着第一角别瞎猜
     var nat = hoverNat;
     if (!nat) return;
-    var b = rectFrom(pending.p, nat);
-    // 松手时框还太小（点完没移动就松开了）→ **保留第一角**，用户仍可 Ctrl 再点第二角。
-    // 若在这里消费掉 pending，一次误松手就把第一角弄丢了。
-    if (!bigEnough(b)) return;
+    // pending.p is accepted only for pre-polygon clients/tests; the current UI always uses points.
+    if (!pending.points && pending.p){
+      var rb = rectFrom(pending.p, nat);
+      if (!bigEnough(rb)) return;
+      pending = null;
+      commitPolygon(targetKey, [[rb.x0,rb.y0],[rb.x1,rb.y0],[rb.x1,rb.y1],[rb.x0,rb.y1]]);
+      redraw();
+      return;
+    }
+      if (KEY2SHAPE[targetKey] === 'rectangle') return;
+      var points = pending.points.slice();
+    if (nat && (points.length === 0 || points[points.length-1][0] !== nat[0] || points[points.length-1][1] !== nat[1])) points.push(nat);
+    if (points.length < 3) return;
     pending = null;
-    commitBox(targetKey, b);
+    commitPolygon(targetKey, points);
     redraw();
   }
   // 右键：清除此框。先取消还没闭合的半成品；没有半成品时，若鼠标压在某个已落定的框上
@@ -1631,6 +1808,7 @@ ANNO_JS = """
   // ---- 按钮联动：✕ 清除该特征的框 ----
   function clearKey(key){
     pending = null;
+    if (KEY2MULTI[key]) multiDirty = false;
     delete boxes[key];                  // 先本地清掉，点一下即消失
     if (canvas) { redraw(); place(); }
     // 注意：这里**不能**立刻 fetchBoxes()。服务端要等本次 Gradio 事件跑完才清掉框，
@@ -1640,6 +1818,10 @@ ANNO_JS = """
   // 键盘总入口：数字键答题并前移、↑/↓ 跨题移动、Enter 保存并下一张
   function onKeydown(e){
     if (e.ctrlKey || e.metaKey || e.altKey) return;
+    if ((e.key === ' ' || e.code === 'Space') && !isTyping(e.target)){
+      if (finishMultiRect()) { e.preventDefault(); e.stopPropagation(); }
+      return;
+    }
     // Enter 单独判：只读字段（如「句子预览」）不算「正在输入」，按 Enter 仍应保存；
     // 可写字段（建作业表单）里照常换行/输入，不抢 Enter。
     if (e.key === 'Enter'){
@@ -1674,7 +1856,7 @@ ANNO_JS = """
   // 那时按 name + 下标兜底会把**每个选项**当成一题，方向键就变成在同一题的选项间乱跳。
   function radiosOf(key){
     var el = document.getElementById('q-' + key);
-    return el ? Array.prototype.slice.call(el.querySelectorAll('input[type="radio"]')) : [];
+    return el ? Array.prototype.slice.call(el.querySelectorAll('input[type="radio"], input[type="checkbox"]')) : [];
   }
   function optionText(inp){
     var lb = inp.closest ? inp.closest('label') : null;
@@ -1703,6 +1885,24 @@ ANNO_JS = """
     for (var i = 0; i < g.length; i++) if (g[i].checked) return stripNum(optionText(g[i]));
     return '';
   }
+  function featureVisible(f){
+    var parent = f[4], eq = f[5], neq = f[6];
+    if (!parent) return true;
+    var cur = checkedLabel(parent);
+    if (eq) return cur === eq;
+    if (neq) return cur !== neq;
+    return true;
+  }
+  function syncConditionalVisibility(){
+    FEATS.forEach(function(f){
+      var el = document.getElementById('q-' + f[0]);
+      if (el && el.style) el.style.display = featureVisible(f) ? '' : 'none';
+    });
+    BBOX.forEach(function(b){
+      var el = document.getElementById('bx-' + b[0]);
+      if (el && el.style) el.style.display = featureVisible([b[0], b[1], '', 'radio', b[4], b[5], b[6]]) ? '' : 'none';
+    });
+  }
   // 该 bbox 特征此刻是否需要画框：选了「不存在」就不需要（与后端 box_target 同一规则）
   function needsBox(feat){
     var absent = feat[2];
@@ -1728,6 +1928,22 @@ ANNO_JS = """
     if (i < 0 || i >= its.length) return from;
     return i;
   }
+  // 完成一个拉框后，高亮自动落到下一个可标注项（例如异常振幅 → 面波）。
+  // 该推进在本地提交时立即发生，服务端回读只负责最终校正，避免保存请求的时序造成旧目标闪回。
+  function advanceAfterBox(key, updateTarget){
+    var its = items();
+    for (var i = 0; i < its.length; i++){
+      if (its[i].kind === 'box' && its[i].key === key){
+        cursor = nextIndex(its, i, 1);
+        if (updateTarget){
+          targetKey = (its[cursor] && its[cursor].kind === 'box') ? its[cursor].key : null;
+          targetNote = '';
+        }
+        paintCursor(true);
+        return;
+      }
+    }
+  }
   // 题序 = 各选择题（配置顺序）→ 各拉框项，与界面编号 1..N 严格一致；
   // 每项自带高亮元素 el（选择题 = 该题的 #q-<key> 容器，拉框项 = #bx-<key>）。
   function items(){
@@ -1735,11 +1951,11 @@ ANNO_JS = """
     FEATS.forEach(function(f){
       var el = document.getElementById('q-' + f[0]);
       var g = radiosOf(f[0]);
-      if (el && g.length) out.push({kind:'radio', key:f[0], el:el, group:g});
+      if (el && g.length && featureVisible(f)) out.push({kind:'radio', key:f[0], el:el, group:g});
     });
     BBOX.forEach(function(b){
       var el = document.getElementById('bx-' + b[0]);
-      if (el) out.push({kind:'box', key:b[0], el:el});
+      if (el && featureVisible([b[0], b[1], '', 'radio', b[4], b[5], b[6]])) out.push({kind:'box', key:b[0], el:el});
     });
     return out;
   }
@@ -1834,7 +2050,19 @@ ANNO_JS = """
     // 鼠标点选某一题 → 光标跟过去（方便接着用键盘往下答）
     document.addEventListener('change', function(e){
       var t = e.target;
-      if (!t || t.type !== 'radio' || !t.closest || !t.closest('#anno_featcol')) return;
+      if (!t || (t.type !== 'radio' && t.type !== 'checkbox') || !t.closest || !t.closest('#anno_featcol')) return;
+      if (t.type === 'checkbox'){
+        var q = t.closest('[id^="q-"]'), key = q ? q.id.replace(/^q-/, '') : '';
+        var feat = featOf(key), exclusive = (feat && feat[7]) || [];
+        var label = stripNum(optionText(t));
+        radiosOf(key).forEach(function(other){
+          if (other === t || !other.checked) return;
+          var otherLabel = stripNum(optionText(other));
+          if ((t.checked && exclusive.indexOf(label) >= 0) ||
+              (t.checked && exclusive.indexOf(otherLabel) >= 0)) other.click();
+        });
+      }
+      syncConditionalVisibility();
       var its = items();
       for (var i = 0; i < its.length; i++){
         if (its[i].kind === 'radio' && its[i].group.indexOf(t) >= 0){ cursor = i; break; }
@@ -1861,7 +2089,7 @@ ANNO_JS = """
       var fcol = document.getElementById('anno_featcol');
       if (fcol){
         new MutationObserver(function(){
-          raf(function(){ paintCursor(false); });
+          raf(function(){ syncConditionalVisibility(); paintCursor(false); });
           scheduleTargetRefresh();
         }).observe(fcol, {childList:true, subtree:true});
       }
@@ -1874,6 +2102,7 @@ ANNO_JS = """
     // 兜底：图片加载/重渲染时序不稳时，周期校正画布位置与 img 事件绑定。
     // place() 已带几何签名判断，没变化时只是两次 rect 读取，不会重排/重绘。
     setInterval(function(){ if (!grab){ var im = getImg(); if (im) raf(function(){ place(); }); } }, 900);
+    syncConditionalVisibility();
     place();
   }
   // 测试钩子：在 Node 里以最小 DOM 桩加载本脚本时暴露纯逻辑，便于无浏览器验证
@@ -1910,7 +2139,8 @@ ANNO_JS = """
   }, 400);
 })();
 </script>
-""".replace("__DRAG_BBOX__", str(_DRAG_BBOX)).replace("__ANNO_FEATS__", str(_ANNO_FEATS))
+""".replace("__DRAG_BBOX__", json.dumps(_DRAG_BBOX, ensure_ascii=False)) \
+   .replace("__ANNO_FEATS__", json.dumps(_ANNO_FEATS, ensure_ascii=False))
 
 
 def build_app() -> gr.Blocks:
@@ -1980,26 +2210,36 @@ def build_app() -> gr.Blocks:
             with gr.Row(elem_id="anno_body"):
                 with gr.Column(scale=3, elem_id="anno_imgcol", min_width=0):
                     cur_img = gr.Image(
-                        label="当前道集（Ctrl+左键点两角框选；普通左键拖动/拖角微调）",
+                        label="当前道集（按住 Ctrl 点击多个点，松开 Ctrl 完成不规则包络）",
                         type="filepath", height=640)
                 with gr.Column(scale=2, elem_id="anno_featcol", min_width=0):
                     sentence = gr.Textbox(label="句子预览", interactive=False, lines=3)
                     # —— 选择题：单列自上而下 = 题号顺序，当前题会被 JS 高亮 ——
                     # 每题包一层 id=q-<key>：前端按 id 精确分组（不靠 radio 的 name 属性）
+                    question_no = {
+                        "gather_type": 1, "abnormal_amplitude": 2,
+                        "noise_type": 2, "aliasing_noise": 3,
+                        "denoise_quality": 3, "surface_wave": 4,
+                        "near_shot_noise": 5,
+                    }
                     for i, feat in enumerate(feats):
                         with gr.Column(elem_id=f"q-{feat.key}"):
-                            radios.append(
-                                gr.Radio(choices=[fmt_option(o) for o in feat.options],
-                                         label=f"{i + 1}. {feat.name}", value=None))
+                            choices = [fmt_option(o) for o in feat.options]
+                            label = f"{question_no.get(feat.key, i + 1)}. {feat.name}"
+                            if feat.input == "checkbox":
+                                radios.append(gr.CheckboxGroup(choices=choices, label=label,
+                                                               value=[]))
+                            else:
+                                radios.append(gr.Radio(choices=choices, label=label, value=None))
                     # —— 拉框项统一放在所有选择题之后 ——
                     for bi, feat in enumerate(bbox_feats()):
                         with gr.Column(elem_id=f"bx-{feat.key}"):
-                            gr.Markdown(f"**{len(feats) + bi + 1}. {feat.name} 拉框**"
-                                        f"（Ctrl+左键点两角；普通左键拖动/拖角微调）")
+                            gr.Markdown(f"**{feat.name} 包络**"
+                                        f"（按住 Ctrl 依次点击多个点，松开 Ctrl 完成）")
                             with gr.Row():
-                                btn_clear = gr.Button("✕ 清除此框", size="sm",
+                                btn_clear = gr.Button("✕ 清除此包络", size="sm",
                                                       elem_id=f"cb-{feat.key}")
-                            box_statuses.append(gr.Markdown("未画框"))
+                            box_statuses.append(gr.Markdown("未画包络"))
                             box_buttons.append((feat.key, btn_clear))
                             if feat.key == FILTER_FEAT_KEY:
                                 # 四角频率 + 单键开关：点一次应用、再点一次还原。
@@ -2132,10 +2372,17 @@ def main():
         if not user or ACC.role(user) is None:
             return JSONResponse({"ok": False, "err": "unknown user"}, status_code=401)
         try:
-            ok, msg = apply_drag_box(user,
-                                     str(p.get("key") or ""),
-                                     float(p.get("x0")), float(p.get("y0")),
-                                     float(p.get("x1")), float(p.get("y1")))
+            regions = p.get("regions")
+            if regions is not None:
+                ok, msg = apply_drag_regions(user, str(p.get("key") or ""), regions)
+                return {"ok": ok, "msg": msg}
+            points = p.get("points")
+            if not points:
+                points = [[float(p.get("x0")), float(p.get("y0"))],
+                          [float(p.get("x1")), float(p.get("y0"))],
+                          [float(p.get("x1")), float(p.get("y1"))],
+                          [float(p.get("x0")), float(p.get("y1"))]]
+            ok, msg = apply_drag_polygon(user, str(p.get("key") or ""), points)
         except Exception as e:                       # noqa: BLE001 —— 统一转 400 提示
             return JSONResponse({"ok": False, "err": str(e)}, status_code=400)
         return {"ok": ok, "msg": msg}

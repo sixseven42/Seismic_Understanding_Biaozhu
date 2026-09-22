@@ -100,6 +100,32 @@ def overlay_boxes(img_path: str, boxes: list[tuple[list[int], str, str]],
     return out_path
 
 
+def overlay_polygons(img_path: str, polygons: list[tuple[list[list[int]], str, str]],
+                     out_path: str) -> str:
+    """Overlay closed polygon envelopes on a display image."""
+    from PIL import Image, ImageDraw, ImageFont
+    img = Image.open(img_path).convert("RGB")
+    draw = ImageDraw.Draw(img)
+    font = None
+    font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "fonts", "NotoSansCJKsc-Regular.otf")
+    if os.path.isfile(font_path):
+        font = ImageFont.truetype(font_path, 18)
+    for points, color, label in polygons:
+        pts = [(int(round(x)), int(round(y))) for x, y in points]
+        if len(pts) < 3:
+            continue
+        closed = pts + [pts[0]]
+        for off in range(3):
+            shifted = [(x + off, y + off) for x, y in closed]
+            draw.line(shifted, fill=color, width=1, joint="curve")
+        if label and font is not None:
+            draw.text((pts[0][0] + 4, pts[0][1] + 4), label, fill=color, font=font)
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+    img.save(out_path)
+    return out_path
+
+
 def render_gather(
     data: np.ndarray,
     out_path: str | None = None,

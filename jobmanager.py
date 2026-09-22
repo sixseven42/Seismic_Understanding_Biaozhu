@@ -326,7 +326,7 @@ def open_job(meta: dict, gathers: list[Gather], ns: int, provider) -> Job:
 def finalize_regions(cfg, selection: dict, boxes: dict):
     """bbox 特征：选择「不存在」→ 区域置 None；否则必须已画框。返回 (regions, errs)。"""
     regions, errs = {}, []
-    for f in cfg.features:
+    for f in cfg.active_features(selection):
         if not f.bbox:
             continue
         lab = selection.get(f.name)
