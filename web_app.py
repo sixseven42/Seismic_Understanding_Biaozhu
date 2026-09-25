@@ -41,6 +41,9 @@ os.environ.setdefault("MPLCONFIGDIR", tempfile.mkdtemp(prefix="mplcfg_"))
 
 # 面波区「⚙ 滤波」挂在这个特征下（需求指定）；改 label_config.yaml 里的 key 时同步改这里
 FILTER_FEAT_KEY = "surface_wave"
+DISPLAY_CLIP_MIN = 90.0
+DISPLAY_CLIP_MAX = 99.9
+DISPLAY_CLIP_STEP = 0.1
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "label_config.yaml")
 USERS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.yaml")
@@ -125,6 +128,7 @@ def _visit(st: dict, job_id: str, gid: str):
         _push_hist(st, old)
     st["job_id"] = job_id
     st["gid"] = gid
+    st["residual_layer"] = 0
 
 
 def _user(request) -> str:
@@ -196,6 +200,16 @@ def _job_filter_params(st: dict) -> dict | None:
     return (st.get("filter_params") or {}).get(st.get("job_id"))
 
 
+def _display_clip(job, st: dict) -> float:
+    """当前作业共享的显示 clip；未调过时取建作业预览值。"""
+    saved = getattr(job, "display_clip", job.clip)
+    try:
+        value = float(saved)
+    except (TypeError, ValueError):
+        value = float(job.clip)
+    return round(min(DISPLAY_CLIP_MAX, max(DISPLAY_CLIP_MIN, value)), 1)
+
+
 def _filter_fields(user: str):
     """滤波参数输入框的 4 个输出值：回填该作业已存的统一参数；无则不动（gr.skip）。
 
@@ -213,6 +227,11 @@ def _radio_value(job, gid: str, feat, st: dict):
     by_key = (rec.get("labels") or {}) if rec else {}
     partial = st.get("partial") or {}
     want = partial.get(feat.name) if feat.name in partial else by_key.get(feat.key)
+    if feat.name == "集合类型":
+        # The collection branch is a property of the job, not an annotation
+        # choice.  Always override stale records/session state so the normal
+        # UI cannot display or submit the opposite branch.
+        want = "残差" if job.job_type == "residual" else "炮集"
     if feat.input == "checkbox":
         values = want if isinstance(want, list) else ([want] if want else [])
         return [fmt_option(opt) for opt in feat.options if opt.label in values]
@@ -251,6 +270,10 @@ def _selection(job, gid: str, st: dict) -> dict:
         v = _radio_value(job, gid, f, st)
         if v:
             sel[f.name] = [label_of(x) for x in v] if isinstance(v, list) else label_of(v)
+    if "集合类型" not in sel:
+        sel["集合类型"] = "残差" if job.job_type == "residual" else "炮集"
+    else:
+        sel["集合类型"] = "残差" if job.job_type == "residual" else "炮集"
     return sel
 
 
@@ -283,7 +306,10 @@ def render_display(request: gr.Request) -> str:
     job = JM.get(st["job_id"])
     gid = st["gid"]
     # 面波区「滤波」：状态与 gid 绑定，换道集自动回落到干净图（web_core.active_filter）
-    base = job.display_image(gid, bandpass=active_filter(st, gid))
+    layer = max(0, min(job.layer_count - 1, int(st.get("residual_layer", 0) or 0)))
+    st["residual_layer"] = layer
+    base = job.display_image(gid, bandpass=active_filter(st, gid), layer=layer,
+                             clip_percentile=_display_clip(job, st))
     overlays = []
     boxes = _current_boxes(job, gid, st)
     sel = _selection(job, gid, st)
@@ -369,12 +395,16 @@ def show_current(request: gr.Request):
     meta = job.gather_meta(gid)
     rec = job.store.get(gid)
     state = "已标注 ✔" if rec else "未标注"
+    layer = max(0, min(job.layer_count - 1, int(st.get("residual_layer", 0) or 0)))
+    st["residual_layer"] = layer
+    layer_text = f" | 显示：{job.layer_names[layer]} ({layer + 1}/{job.layer_count})"
     info = (f"**道集 {gid}** | 键 {meta['key']} = {meta['value_text']}"
-            f" | {meta['n_traces']} 道 | {state} | {_progress_text(job, st)}")
+            f" | {meta['n_traces']} 道 | 作业类型：{('残差' if job.job_type == 'residual' else '炮集')}"
+            f"{layer_text} | {state} | {_progress_text(job, st)}")
     sel = _selection(job, gid, st)
     sentence = CFG.render_sentence(sel)
     return (img, info, sentence, *_radio_updates(job, gid, st), *box_statuses_of(request),
-            *_filter_fields(user), _my_total_text(user))
+            *_filter_fields(user), _display_clip(job, st), _my_total_text(user))
 
 
 def _anno_idle(msg: str = ""):
@@ -386,7 +416,7 @@ def _anno_idle(msg: str = ""):
     """
     return (gr.update(value=None), msg, "", *([gr.update(value=None)] * len(CFG.features)),
             *(["…"] * len(bbox_feats())), *((gr.skip(),) * len(FILTER_KEYS)),
-            gr.skip())
+            gr.skip(), gr.skip())
 
 
 def refresh_anno(request: gr.Request):
@@ -395,6 +425,47 @@ def refresh_anno(request: gr.Request):
     if not st.get("job_id") or not st.get("gid"):
         return _anno_idle("请选择作业（选中即自动领取第一张）")
     return show_current(request)
+
+
+def cycle_residual_layer(request: gr.Request, direction: int = 1):
+    """Move through residual preview layers in either direction."""
+    user = _user(request)
+    st = wstate(user)
+    if not st.get("job_id") or not st.get("gid"):
+        return _anno_idle("⚠️ 请先领取道集")
+    job = JM.get(st["job_id"])
+    if job.job_type != "residual":
+        return show_current(request)
+    JM.renew(job.job_id, user)
+    step = 1 if int(direction) >= 0 else -1
+    st["residual_layer"] = (int(st.get("residual_layer", 0) or 0) + step) % job.layer_count
+    return show_current(request)
+
+
+def cycle_residual_previous(request: gr.Request):
+    return cycle_residual_layer(request, -1)
+
+
+def cycle_residual_next(request: gr.Request):
+    return cycle_residual_layer(request, 1)
+
+
+def update_display_clip(request: gr.Request, value):
+    """调整当前作业的显示 clip，并立即重绘当前道集。"""
+    user = _user(request)
+    st = wstate(user)
+    if not st.get("job_id") or not st.get("gid"):
+        return gr.skip()
+    job = JM.get(st["job_id"])
+    try:
+        clip = round(float(value), 1)
+    except (TypeError, ValueError):
+        clip = _display_clip(job, st)
+    clip = min(DISPLAY_CLIP_MAX, max(DISPLAY_CLIP_MIN, clip))
+    # 显示参数属于工区/作业：下一位标注者领取该作业内道集时也沿用它。
+    job.display_clip = clip
+    JM.renew(job.job_id, user)
+    return render_display(request)
 
 
 # ----------------------------------------------------------------------
@@ -417,6 +488,12 @@ def load_file(request: gr.Request, path: str, endian_text: str):
             f" | 道数: {i['n_traces']} | 每道采样点: {i['ns']}"
             f" | 采样间隔: {i['dt_ms']} ms | 格式码: {i['format_code']}"
             f" | 大小: {i['file_size_mb']} MB")
+
+
+def load_job_source(request: gr.Request, job_type, path, before_path, endian_text):
+    """Read the shot source or the residual job's first (before) source."""
+    source = before_path if str(job_type) == "残差" else path
+    return load_file(request, source, endian_text)
 
 
 def scan_values(request: gr.Request, path: str, endian_text: str, gkey_text: str):
@@ -446,6 +523,12 @@ def scan_values(request: gr.Request, path: str, endian_text: str, gkey_text: str
     return gr.CheckboxGroup(choices=strs, value=strs), hint
 
 
+def scan_job_values(request: gr.Request, job_type, path, before_path,
+                    endian_text, gkey_text):
+    source = before_path if str(job_type) == "残差" else path
+    return scan_values(request, source, endian_text, gkey_text)
+
+
 def _parse_job_values(sort_text: str, gkey_text: str, selected: list[str]):
     """返回 (sort_keys, extract_keys, values)，解析失败抛 ValueError。"""
     sort_keys = parse_ranges(sort_text)
@@ -467,7 +550,8 @@ def _parse_job_values(sort_text: str, gkey_text: str, selected: list[str]):
 
 
 def create_job_ui(request: gr.Request, path, endian_text, sort_text, gkey_text,
-                  selected, clip, aug_lo, aug_hi, title, min_traces, decimate_n):
+                  selected, clip, aug_lo, aug_hi, title, min_traces, decimate_n,
+                  job_type="炮集", before_path="", after_path="", residual_path=""):
     """创建作业：抽一次道集（按道数下限滤去过少者、按抽稀间隔等间隔删）、写 job.json、注册。
 
     clip: 预览 clip（仅界面显示/画框参照）；aug_lo/aug_hi: 保存时随机采样的 clip 范围。
@@ -476,7 +560,16 @@ def create_job_ui(request: gr.Request, path, endian_text, sort_text, gkey_text,
     user = _user(request)
     if not _is_admin(user):
         return "❌ 仅管理员可创建作业", gr.update(), gr.update()
-    path = (path or "").strip()
+    job_type = "residual" if str(job_type or "炮集") in ("残差", "residual") else "shot"
+    if job_type == "residual":
+        source_files = [(before_path or "").strip(), (after_path or "").strip(),
+                        (residual_path or "").strip()]
+        if not all(source_files):
+            return "⚠️ 残差作业需要填写去噪前、去噪后、噪声残差三个 SGY 文件路径", gr.update(), gr.update()
+        path = source_files[0]
+    else:
+        source_files = [(path or "").strip()]
+        path = source_files[0]
     if not path:
         return "⚠️ 请填写文件路径", gr.update(), gr.update()
     endian = {"自动检测": "auto", "大端": "big", "小端": "little"}[endian_text]
@@ -512,7 +605,8 @@ def create_job_ui(request: gr.Request, path, endian_text, sort_text, gkey_text,
     try:
         job = JM.create_job(path, sort_keys, gkeys, values,
                             clip, title, user, endian=endian, min_traces=min_traces,
-                            aug_lo=aug_lo, aug_hi=aug_hi, decimate_n=decimate_n)
+                            aug_lo=aug_lo, aug_hi=aug_hi, decimate_n=decimate_n,
+                            job_type=job_type, source_files=source_files)
     except (JobError, SegyReadError) as e:
         return f"❌ {e}", gr.update(), gr.update()
     n = len(job.gather_ids())
@@ -525,7 +619,8 @@ def create_job_ui(request: gr.Request, path, endian_text, sort_text, gkey_text,
     note = f"（先滤后抽：{'、'.join(applied)}）" if applied else ""
     job_choices = _job_choices(user)
     mgr_choices = [j["job_id"] for j in JM.list_jobs()]
-    return (f"✔ 已创建作业 {job.job_id}（键 {ranges_label(gkeys)}）｜道集数 {n}{note}"
+    mode_text = "残差（去噪前/去噪后/噪声残差）" if job_type == "residual" else "炮集"
+    return (f"✔ 已创建{mode_text}作业 {job.job_id}（键 {ranges_label(gkeys)}）｜道集数 {n}{note}"
             f"｜保存时每张增强 {N_AUG} 个随机 clip",
             gr.update(choices=job_choices, value=[job.job_id]),
             gr.update(choices=mgr_choices, value=job.job_id))
@@ -569,6 +664,7 @@ def _claim_from_pool(request: gr.Request):
     if out.get("gid"):
         _visit(st, out["job_id"], out["gid"])   # job_id = 当前道集所属作业（保存/进度都按它走）
         st["partial"], st["boxes"] = {}, {}
+        st["residual_layer"] = 0
         n_job = len(_norm_job_ids(st.get("job_ids")))
         note = (f"已自动从作业池领取下一张「{out['gid']}」" if n_job > 1
                 else f"已自动领取下一张「{out['gid']}」")
@@ -631,7 +727,7 @@ def clear_box(request: gr.Request, feat_key: str):
 # ----------------------------------------------------------------------
 def _filter_outputs(request: gr.Request, msg: str, fresh_img: bool):
     """滤波开关的统一输出，**与 anno_outputs 严格同序同长**：
-        (img, info, sentence, *radios, *box_statuses, *4 个滤波参数)
+        (img, info, sentence, *radios, *box_statuses, *4 个滤波参数, clip, 累计)
 
     滤波只改「图 / 提示 / 参数字段」三处，句子、单选、框状态一律 gr.skip() 保持不动
     （滤波不影响选择）；参数字段回填该作业已存的统一参数（_filter_fields）。
@@ -641,9 +737,11 @@ def _filter_outputs(request: gr.Request, msg: str, fresh_img: bool):
     st = wstate(user)
     n_other = 1 + len(CFG.features) + len(bbox_feats())   # sentence + radios + 框状态
     if not st.get("job_id") or not st.get("gid"):
-        return (gr.skip(), msg, *((gr.skip(),) * (n_other + len(FILTER_KEYS))), gr.skip())
+        return (gr.skip(), msg, *((gr.skip(),) * (n_other + len(FILTER_KEYS))),
+                gr.skip(), gr.skip())
     img = render_display(request) if fresh_img else gr.skip()
-    return (img, msg, *((gr.skip(),) * n_other), *_filter_fields(user), gr.skip())
+    return (img, msg, *((gr.skip(),) * n_other), *_filter_fields(user),
+            gr.skip(), gr.skip())
 
 
 def toggle_filter(request: gr.Request, f1, f2, f3, f4):
@@ -816,8 +914,8 @@ def save_anno(request: gr.Request, *radio_values):
     if not ok:
         cur = show_current(request)
         return (cur[0], "⚠️ " + err, cur[2], *cur[3:])
-    # 云上传由增强图后台渲染完成后的钩子统一触发（JM.set_aug_hook）：那 5 张 PNG 是后台
-    # 画的，只有画完才谈得上上传；labels.jsonl 同步落盘但那点延迟无所谓。
+    # 云上传由图片后台渲染完成后的钩子统一触发（JM.set_aug_hook）：图片画完后再上传；
+    # labels.jsonl 与 NPY 已同步落盘。
     n_labeled, total = JM.progress(job_id)
     st.pop("partial", None)
     st.pop("boxes", None)
@@ -829,10 +927,14 @@ def save_anno(request: gr.Request, *radio_values):
     st.pop("gid", None)
     cur, note = _claim_from_pool(request)
     done = "已覆盖" if was_labeled else "已保存"
+    if JM.get(job_id).job_type == "residual":
+        asset_note = f" × {len(aug_recs)} 张增强图（3 个视图各 5 张，3 个 NPY 已保存；图片后台生成）"
+    else:
+        asset_note = f" × {len(aug_recs)} 张增强图（后台生成中）"
     return (cur[0],
             f"✔ {done}「{rec['gather_id']}」"
             + ("的原结果" if was_labeled else "")
-            + f" × {len(aug_recs)} 张增强图（后台生成中，可继续下一张） | "
+            + asset_note + "，可继续下一张 | "
             f"本作业 {n_labeled}/{total} | {note}",
             cur[2], *cur[3:])
 
@@ -848,7 +950,7 @@ def release_current(request: gr.Request):
     st.pop("boxes", None)
     return (gr.update(value=None), "已归还当前道集（回池，可被他人领取）", "",
             *([gr.update(value=None)] * len(CFG.features)), *(["…"] * len(bbox_feats())),
-            *((gr.skip(),) * len(FILTER_KEYS)), _my_total_text(user))
+            *((gr.skip(),) * len(FILTER_KEYS)), gr.skip(), _my_total_text(user))
 
 
 def skip_current(request: gr.Request):
@@ -1205,6 +1307,7 @@ ANNO_CSS = """
    用 max-width/max-height 等比约束 + flex 居中：<img> 元素框恰等于所绘图区域，
    图上点框坐标与像素映射不受影响。 */
 #anno_body { align-items: stretch; }
+#preview-clip-slider { flex: 0 1 300px !important; max-width: 300px; }
 #anno_imgcol, #anno_featcol { min-width: 0; }
 #anno_imgcol { display: flex; flex-direction: column; }
 #anno_imgcol > .block {
@@ -1818,6 +1921,20 @@ ANNO_JS = """
   // 键盘总入口：数字键答题并前移、↑/↓ 跨题移动、Enter 保存并下一张
   function onKeydown(e){
     if (e.ctrlKey || e.metaKey || e.altKey) return;
+    // Residual jobs cycle the three aligned sources with D or Right Arrow.
+    // The mode is server-authored in the gather info, so shot jobs keep the
+    // existing Right Arrow question navigation behavior.
+    if (isResidualMode() && (e.key === 'a' || e.key === 'A' || e.key === 'ArrowLeft'
+        || e.key === 'd' || e.key === 'D' || e.key === 'ArrowRight')){
+      if (isTyping(e.target)) return;
+      var next = e.key === 'd' || e.key === 'D' || e.key === 'ArrowRight';
+      var btnId = next ? '#btn-residual-next' : '#btn-residual-prev';
+      var layerBtn = document.querySelector(btnId + ' button, ' + btnId);
+      if (layerBtn){
+        e.preventDefault(); e.stopPropagation(); layerBtn.click();
+      }
+      return;
+    }
     if ((e.key === ' ' || e.code === 'Space') && !isTyping(e.target)){
       if (finishMultiRect()) { e.preventDefault(); e.stopPropagation(); }
       return;
@@ -1849,6 +1966,17 @@ ANNO_JS = """
     if (d === null) return;
     if (handleDigit(d)) e.preventDefault();
     else paintCursor(false);
+  }
+  function isResidualMode(){
+    var infoEl = document.getElementById('anno_info');
+    return checkedLabel('gather_type') === '残差' ||
+      !!(infoEl && (infoEl.textContent || '').indexOf('作业类型：残差') >= 0);
+  }
+  function syncResidualButton(){
+    ['btn-residual-prev', 'btn-residual-next'].forEach(function(id){
+      var button = document.getElementById(id);
+      if (button && button.style) button.style.display = isResidualMode() ? '' : 'none';
+    });
   }
   // ---- 键盘：数字键答当前题并自动前移（焦点在文本框里时不拦截）----
   // 每题单独包在一个 id=q-<key> 的容器里（见 build_app），据此**按 id 确定性分组**。
@@ -2089,9 +2217,13 @@ ANNO_JS = """
       var fcol = document.getElementById('anno_featcol');
       if (fcol){
         new MutationObserver(function(){
-          raf(function(){ syncConditionalVisibility(); paintCursor(false); });
+          raf(function(){ syncConditionalVisibility(); syncResidualButton(); paintCursor(false); });
           scheduleTargetRefresh();
         }).observe(fcol, {childList:true, subtree:true});
+      }
+      var info = document.getElementById('anno_info');
+      if (info){
+        new MutationObserver(syncResidualButton).observe(info, {childList:true, subtree:true});
       }
     }
     window.addEventListener('load', function(ev){
@@ -2103,6 +2235,7 @@ ANNO_JS = """
     // place() 已带几何签名判断，没变化时只是两次 rect 读取，不会重排/重绘。
     setInterval(function(){ if (!grab){ var im = getImg(); if (im) raf(function(){ place(); }); } }, 900);
     syncConditionalVisibility();
+    syncResidualButton();
     place();
   }
   // 测试钩子：在 Node 里以最小 DOM 桩加载本脚本时暴露纯逻辑，便于无浏览器验证
@@ -2156,6 +2289,7 @@ def build_app() -> gr.Blocks:
 
         # ---------- ① 建作业（仅管理员可见，服务端校验为准） ----------
         with gr.Accordion("① 建作业（仅管理员）", open=False, visible=False) as admin_build:
+            job_type = gr.Dropdown(["炮集", "残差"], value="炮集", label="作业类型（管理员创建时确定）")
             with gr.Row():
                 file_path = gr.Textbox(label="sgy/segy 文件路径", scale=3,
                                        placeholder="/path/to/xxx.sgy")
@@ -2163,6 +2297,14 @@ def build_app() -> gr.Blocks:
                                      label="字节序", scale=1)
                 btn_load = gr.Button("读取文件信息", scale=1)
             file_info = gr.Markdown("尚未加载文件")
+            with gr.Column(visible=False) as residual_files:
+                residual_before = gr.Textbox(label="去噪前 SGY 文件路径",
+                                             placeholder="/path/to/before.sgy")
+                residual_after = gr.Textbox(label="去噪后 SGY 文件路径",
+                                            placeholder="/path/to/after.sgy")
+                residual_noise = gr.Textbox(label="噪声残差 SGY 文件路径",
+                                            placeholder="/path/to/residual.sgy")
+                gr.Markdown("残差作业会校验三份文件的道数、采样布局和全部道头一致，再按同一 line 对齐显示。")
             with gr.Row():
                 sort_keys = gr.Textbox(label="排序键（逗号分隔，1-based）", value="9-12,189-192")
                 gkey = gr.Textbox(label="抽道集键", value="9-12,189-192")
@@ -2199,9 +2341,17 @@ def build_app() -> gr.Blocks:
             with gr.Row():
                 mine_dd = gr.Dropdown(choices=[], label="我标注的（选择以重开编辑）", scale=3)
                 btn_inherit = gr.Button("⧉ 继承最近已标注", scale=1)
-            anno_info = gr.Markdown("请选择作业（选中即自动领取第一张）")
+            anno_info = gr.Markdown("请选择作业（选中即自动领取第一张）", elem_id="anno_info")
             # 本用户的标注总量（跨全部作业，不区分作业）——常驻显示，随每次标注刷新
             my_total_md = gr.Markdown(_my_total_text(_user(None) or ""))
+            with gr.Row(elem_id="display-controls"):
+                display_clip = gr.Slider(
+                    minimum=DISPLAY_CLIP_MIN, maximum=DISPLAY_CLIP_MAX,
+                    value=99.0, step=DISPLAY_CLIP_STEP,
+                    label="显示 clip 分位数", scale=0, min_width=280,
+                    elem_id="preview-clip-slider")
+                btn_residual_prev = gr.Button("上一个视图（A / ←）", elem_id="btn-residual-prev", scale=0)
+                btn_residual_next = gr.Button("下一个视图（D / →）", elem_id="btn-residual-next", scale=0)
             radios = []
             box_statuses = []
             box_buttons = []   # (feature_key, 清除按钮)
@@ -2228,9 +2378,10 @@ def build_app() -> gr.Blocks:
                             label = f"{question_no.get(feat.key, i + 1)}. {feat.name}"
                             if feat.input == "checkbox":
                                 radios.append(gr.CheckboxGroup(choices=choices, label=label,
-                                                               value=[]))
+                                                             value=[], interactive=(feat.name != "集合类型")))
                             else:
-                                radios.append(gr.Radio(choices=choices, label=label, value=None))
+                                radios.append(gr.Radio(choices=choices, label=label, value=None,
+                                                        interactive=(feat.name != "集合类型")))
                     # —— 拉框项统一放在所有选择题之后 ——
                     for bi, feat in enumerate(bbox_feats()):
                         with gr.Column(elem_id=f"bx-{feat.key}"):
@@ -2296,17 +2447,26 @@ def build_app() -> gr.Blocks:
                    mgr_progress, my_total_md])
         btn_logout.click(logout_click, None, who)
 
-        btn_load.click(load_file, [file_path, endian], file_info)
-        btn_scan.click(scan_values, [file_path, endian, gkey], [values_box, scan_info])
+        def _job_type_visibility(t):
+            residual = str(t) == "残差"
+            return gr.update(visible=not residual), gr.update(visible=residual)
+
+        job_type.change(_job_type_visibility, job_type, [file_path, residual_files])
+        btn_load.click(load_job_source,
+                       [job_type, file_path, residual_before, endian], file_info)
+        btn_scan.click(scan_job_values,
+                       [job_type, file_path, residual_before, endian, gkey],
+                       [values_box, scan_info])
         btn_create.click(create_job_ui,
                          [file_path, endian, sort_keys, gkey, values_box, clip,
-                          aug_lo, aug_hi, title, min_traces, decimate_n],
+                          aug_lo, aug_hi, title, min_traces, decimate_n,
+                          job_type, residual_before, residual_after, residual_noise],
                          [build_info, job_dd, mgr_job_dd])
 
         # 尾部 4 个是滤波参数输入框（按作业回填，见 _filter_fields）
         filter_nums = list(filter_ui["nums"]) if filter_ui is not None else []
         anno_outputs = [cur_img, anno_info, sentence, *radios, *box_statuses, *filter_nums,
-                        my_total_md]
+                        display_clip, my_total_md]
         job_dd.change(select_jobs, job_dd, anno_outputs + [mine_dd])
         mine_dd.change(reopen_mine, [job_dd, mine_dd], anno_outputs)
         btn_claim.click(claim_next, job_dd, anno_outputs)
@@ -2315,6 +2475,10 @@ def build_app() -> gr.Blocks:
         btn_refresh.click(refresh_page, None, [job_dd, mine_dd, *anno_outputs])
         btn_save.click(save_anno, radios, anno_outputs)
         btn_back.click(back_previous, None, anno_outputs)
+        btn_residual_prev.click(cycle_residual_previous, None, anno_outputs)
+        btn_residual_next.click(cycle_residual_next, None, anno_outputs)
+        display_clip.change(update_display_clip, display_clip, cur_img,
+                            show_progress="hidden")
         # outputs 带上框状态：继承是程序化改选项，框状态标记是前端唯一能拿到的"该刷新了"信号
         # （详见 inherit_previous 的 docstring）
         btn_inherit.click(inherit_previous, None, [sentence, *radios, *box_statuses])

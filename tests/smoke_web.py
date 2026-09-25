@@ -81,8 +81,22 @@ class SmokeWebFilter(unittest.TestCase):
             return fh.read()
 
     def _anno_arity(self):
-        """anno_outputs 的应有长度：img+info+sentence + 各 radio + 各 bbox 状态 + 4 参数。"""
-        return 4 + len(CFG.features) + len(web_app.bbox_feats()) + 4
+        """anno_outputs：基础显示项 + 各 radio/框状态 + 4 个滤波参数 + clip + 累计。"""
+        return 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4
+
+    def test_display_clip_is_remembered_within_job(self):
+        ann, gid = self._claimed()
+        before = web_app.render_display(ann)
+        changed = web_app.update_display_clip(ann, 90.0)
+        self.assertNotEqual(changed, before)
+        self.assertIn("__clip90", os.path.basename(changed))
+        self.assertEqual(self.job.display_clip, 90.0)
+
+        web_app.save_anno(ann, *radio_values_for(full_selection()))
+        nxt = web_app.wstate("ann1")["gid"]
+        self.assertNotEqual(nxt, gid)
+        self.assertIn("__clip90", os.path.basename(web_app.render_display(ann)))
+        self.assertEqual(web_app.show_current(ann)[-2], 90.0)
 
     def test_toggle_applies_then_reverts(self):
         ann, gid = self._claimed()
@@ -404,7 +418,7 @@ class SmokeNoReassignAndHint(unittest.TestCase):
         out = web_app.claim_next(ann, [self.job.job_id])
         self.assertNotEqual(out[0], gr.skip(), "空态应清空图片，而不是保留上一张")
         # 空态输出也要与 anno_outputs 同长
-        n = 4 + len(CFG.features) + len(web_app.bbox_feats()) + 4
+        n = 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4
         self.assertEqual(len(out), n)
 
     def test_payload_note_empty_when_no_gather(self):
@@ -612,7 +626,7 @@ class SmokeAutoClaimOnJobSelect(unittest.TestCase):
         self.assertIsNone(web_app.wstate("ann1").get("gid"))
         out = web_app.claim_next(ann, self.job_a.job_id)
         self.assertIsNotNone(web_app.wstate("ann1").get("gid"))
-        self.assertEqual(len(out), 4 + len(CFG.features) + len(web_app.bbox_feats()) + 4)
+        self.assertEqual(len(out), 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4)
 
 
 class SmokeAnnoOutputArity(unittest.TestCase):
@@ -637,7 +651,7 @@ class SmokeAnnoOutputArity(unittest.TestCase):
 
     def _n_anno(self):
         # img + info + sentence + 各 radio + 各 bbox 状态 + 4 个滤波参数
-        return 4 + len(CFG.features) + len(web_app.bbox_feats()) + 4
+        return 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4
 
     def test_anno_events_return_anno_outputs_length(self):
         ann = _Req("ann1")
@@ -708,13 +722,13 @@ class SmokeBackPrevious(unittest.TestCase):
 
     def _save(self, sel=None):
         out = web_app.save_anno(self.ann, *radio_values_for(sel or full_selection()))
-        self.assertEqual(len(out), 4 + len(CFG.features) + len(web_app.bbox_feats()) + 4,
+        self.assertEqual(len(out), 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4,
                          "save_anno 输出长度")
         return self._gid(), out[1]
 
     def _back(self):
         out = web_app.back_previous(self.ann)
-        self.assertEqual(len(out), 4 + len(CFG.features) + len(web_app.bbox_feats()) + 4,
+        self.assertEqual(len(out), 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4,
                          "back_previous 输出长度")
         return out[1]
 

@@ -100,4 +100,4 @@ features:
       - label: 已压制但有残留
 
 sentence_template: "这是一条{集合类型}，异常振幅{异常振幅}，混叠噪声{混叠噪声}，面波{面波}，近炮点强能量噪声{近炮点强能量噪声}。"
-sentence_template_residual: "这是一条{集合类型}，噪声类型{噪声类型}，去噪质量{去噪质量}。"
+sentence_template_residual: "这是一个残差，去噪类型是{噪声类型}，去噪状况为：{去噪质量}。"

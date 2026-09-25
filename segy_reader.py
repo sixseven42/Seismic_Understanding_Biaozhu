@@ -180,6 +180,32 @@ class SegyReader:
             self._raw._mmap.close()
             self._raw = None
 
+    def compatible_with(self, other: "SegyReader") -> tuple[bool, str]:
+        """Check that two SEG-Y files can be displayed trace-for-trace.
+
+        Residual jobs use the trace indices from the first file for all three
+        sources.  Comparing the complete trace headers (rather than only a
+        few commonly used fields) prevents a subtle line/gather misalignment.
+        Sample count and trace count are part of the layout contract as well.
+        """
+        if not isinstance(other, SegyReader):
+            return False, "不是 SEG-Y 读取器"
+        if self.n_traces != other.n_traces:
+            return False, f"道数不一致（{self.n_traces} 与 {other.n_traces}）"
+        if self.ns != other.ns:
+            return False, f"每道采样点数不一致（{self.ns} 与 {other.ns}）"
+        if self.format_code != other.format_code:
+            return False, f"采样格式码不一致（{self.format_code} 与 {other.format_code}）"
+        if self.dt_us != other.dt_us:
+            return False, f"采样间隔不一致（{self.dt_us} 与 {other.dt_us} 微秒）"
+        # Compare in chunks so a multi-million-trace file does not allocate a
+        # second copy of every header just for this validation.
+        for start in range(0, self.n_traces, 65536):
+            stop = min(self.n_traces, start + 65536)
+            if not np.array_equal(self._headers[start:stop], other._headers[start:stop]):
+                return False, "道头不一致（请确认三个文件按同一顺序导出）"
+        return True, ""
+
     def __enter__(self):
         return self
 

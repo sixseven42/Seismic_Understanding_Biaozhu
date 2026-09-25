@@ -159,10 +159,15 @@ class Job:
         self.meta = meta
         self.job_id = meta["job_id"]
         self.title = meta.get("title", "")
+        raw_job_type = str(meta.get("job_type", "shot") or "shot").lower()
+        self.job_type = "residual" if raw_job_type in ("residual", "残差") else "shot"
+        self.source_files = list(meta.get("source_files") or [meta.get("source_file", "")])
         self.output_dir = meta["output_dir"]
         self.state = meta.get("state", "open")
         # clip 语义 v3.6 起 = 仅「界面预览/画框参照」用（导出改为保存时 N_AUG 个随机 clip）
         self.clip = float(meta.get("clip_percentile", 99.0))
+        # 标注阶段可调整的显示 clip：同一作业内所有标注者共享最近一次调整。
+        self.display_clip = self.clip
         # 增强 clip 采样上下限：旧作业（job.json 无 aug_lo/aug_hi）缺失时 aug_ok=False，
         # 视为「需重建」——不能保存、load_all 会将其标 broken。
         self.aug_lo, self.aug_hi = self._read_aug(meta)
@@ -214,8 +219,17 @@ class Job:
                 "n_traces": g.n_traces}
 
     # ---- 数据 / 出图 ----
-    def raw(self, gid: str) -> np.ndarray:
-        return np.asarray(self._provider(self.gather(gid)), dtype=np.float32)
+    def raw(self, gid: str, layer: int = 0) -> np.ndarray:
+        """Read one gather layer.  Shot jobs have only layer 0."""
+        g = self.gather(gid)
+        # Shot providers historically accept only Gather; do not pass the
+        # layer argument there because a legacy provider may have a second
+        # positional default of its own (for example ``lambda g, d=data``).
+        if self.layer_count > 1:
+            data = self._provider(g, int(layer))
+        else:
+            data = self._provider(g)
+        return np.asarray(data, dtype=np.float32)
 
     @staticmethod
     def _bandpass_params(bandpass) -> dict | None:
@@ -230,15 +244,19 @@ class Job:
         except (KeyError, TypeError, ValueError):
             raise JobError("滤波参数缺失或非数值")
 
-    def display_vlim(self, gid: str) -> float:
-        """显示色标界限：**只从原始数据**按预览 clip 分位算一次。
+    def display_vlim(self, gid: str, layer: int = 0,
+                     clip_percentile: float | None = None) -> float:
+        """显示色标界限：**只从去噪前/原始数据**按预览 clip 分位算一次。
 
-        滤波前后共用同一个界限 → 两张图色标一致、可直接对比；滤波压掉的能量
-        会真的显示为变淡，而不是被重新拉伸回满对比度。
+        炮集只有一层；残差三层统一使用第 0 层（去噪前）的界限，保证三张图
+        可以直接对比，后两层不会因自身振幅范围不同而被重新拉伸。
         """
-        return clip_bound(self.raw(gid), self.clip)
+        scale_layer = 0 if self.layer_count > 1 else layer
+        clip = self.clip if clip_percentile is None else float(clip_percentile)
+        return clip_bound(self.raw(gid, scale_layer), clip)
 
-    def _display_data(self, gid: str, bandpass: dict | None, vlim: float) -> np.ndarray:
+    def _display_data(self, gid: str, bandpass: dict | None, vlim: float,
+                      layer: int = 0) -> np.ndarray:
         bp = self._bandpass_params(bandpass)
         steps = []
         if bp is not None:
@@ -247,17 +265,19 @@ class Job:
             steps.append({"name": "bandpass", "params": {**bp, "dt_ms": self.dt_ms}})
         steps.append({"name": "clip_abs", "params": {"vlim": vlim}})
         try:
-            return apply_pipeline(self.raw(gid), steps)
+            return apply_pipeline(self.raw(gid, layer), steps)
         except ValueError as e:                      # preprocess 的参数校验
             raise JobError(str(e))
 
-    def display(self, gid: str, bandpass: dict | None = None) -> np.ndarray:
+    def display(self, gid: str, bandpass: dict | None = None, layer: int = 0,
+                clip_percentile: float | None = None) -> np.ndarray:
         """界面显示数据：原始道集 →（可选）带通滤波 → 按共用色标截断。
 
         滤波只作用于「看」：导出图在 save 时由 self.raw() 渲染，不受本参数影响。
         bandpass 为 {"f1","f2","f3","f4"}（Hz），非法或 dt 未知时抛 JobError。
         """
-        return self._display_data(gid, bandpass, self.display_vlim(gid))
+        vlim = self.display_vlim(gid, layer, clip_percentile)
+        return self._display_data(gid, bandpass, vlim, layer)
 
     @staticmethod
     def aug_image_rel(gather_id: str, clip_value: float) -> str:
@@ -266,6 +286,21 @@ class Job:
 
     def npy_rel(self, gid: str) -> str:
         return f"npy/{gid}.npy"
+
+    @staticmethod
+    def layer_slug(layer: int) -> str:
+        """Stable export name for a residual source layer."""
+        slugs = ("before", "after", "residual")
+        try:
+            return slugs[int(layer)]
+        except (IndexError, TypeError, ValueError):
+            raise JobError(f"残差层编号无效: {layer}")
+
+    def layer_image_rel(self, gid: str, layer: int, clip_value: float) -> str:
+        return f"images/{gid}__{self.layer_slug(layer)}__clip{clip_value:g}.png"
+
+    def layer_npy_rel(self, gid: str, layer: int) -> str:
+        return f"npy/{gid}__{self.layer_slug(layer)}.npy"
 
     @property
     def cache_dir(self) -> str:
@@ -281,20 +316,33 @@ class Job:
         """
         return "__flt" + "-".join(f"{float(bp[k]):g}" for k in ("f1", "f2", "f3", "f4"))
 
-    def display_image(self, gid: str, bandpass: dict | None = None) -> str:
+    def display_image(self, gid: str, bandpass: dict | None = None, layer: int = 0,
+                      clip_percentile: float | None = None) -> str:
         """返回界面显示图绝对路径（.cache/<gid>[__flt…].png，缺则渲染）。
 
-        显示图只用做标注/预览（预览 clip=self.clip），绝不写入导出 images/；
+        显示图只用做标注/预览（预览 clip 可由界面滑块指定），绝不写入导出 images/；
         导出图只在保存时生成 N_AUG 张 <gid>__clip<值>.png，从而保证 images/
         与 labels.jsonl 记录一一对应、无孤立图。
         """
         bp = self._bandpass_params(bandpass)      # 先校验，参数不全就报错而非回落到干净图
-        suffix = "" if bp is None else self._filter_suffix(bp)
+        layer = max(0, min(self.layer_count - 1, int(layer)))
+        layer_suffix = "" if self.layer_count <= 1 else f"__layer{layer}"
+        clip = self.clip if clip_percentile is None else float(clip_percentile)
+        clip_suffix = "" if clip_percentile is None else f"__clip{clip:g}"
+        suffix = layer_suffix + clip_suffix + ("" if bp is None else self._filter_suffix(bp))
         abs_p = os.path.join(self.cache_dir, f"{gid}{suffix}.png")
         if not os.path.isfile(abs_p):
-            vlim = self.display_vlim(gid)
-            self._render_png(self._display_data(gid, bandpass, vlim), abs_p, vlim=vlim)
+            vlim = self.display_vlim(gid, layer, clip)
+            self._render_png(self._display_data(gid, bandpass, vlim, layer), abs_p, vlim=vlim)
         return abs_p
+
+    @property
+    def layer_count(self) -> int:
+        return 3 if self.job_type == "residual" else 1
+
+    @property
+    def layer_names(self) -> tuple[str, ...]:
+        return ("去噪前", "去噪后", "噪声残差") if self.layer_count == 3 else ("炮集",)
 
     def _render_png(self, data: np.ndarray, abs_path: str,
                     vlim: float | None = None) -> str:
@@ -463,8 +511,12 @@ class JobManager:
                   sort_keys, extract_keys, values, clip: float,
                   aug_lo: float, aug_hi: float, created_by: str,
                   output_dir: str, min_traces: int = 0, dt_ms: float = 0.0,
-                  decimate_n: int = 1) -> dict:
+                  decimate_n: int = 1, job_type: str = "shot",
+                  source_files: list[str] | None = None) -> dict:
+        source_files = list(source_files or [path])
         return {"job_id": job_id, "title": title, "source_file": os.path.abspath(path),
+                "source_files": [os.path.abspath(p) for p in source_files],
+                "job_type": job_type,
                 "endian": endian, "sort_keys": [list(k) for k in sort_keys],
                 "extract_keys": [list(k) for k in extract_keys],
                 "values": _json_values(values),
@@ -483,7 +535,8 @@ class JobManager:
                    clip: float | None = None, title: str = "", created_by: str = "",
                    endian: str = "auto", min_traces: int = 0,
                    aug_lo: float = 90.0, aug_hi: float = 99.9,
-                   decimate_n: int = 1) -> Job:
+                   decimate_n: int = 1, job_type: str = "shot",
+                   source_files: list[str] | None = None) -> Job:
         """从真实 sgy 抽道集建作业：写 job.json + 注册。
 
         values: 单字段 list[int] / 多字段 list[tuple]。
@@ -497,6 +550,18 @@ class JobManager:
         clip = 99.0 if clip is None else clip
         if not (0 < aug_lo <= aug_hi <= 100):
             raise JobError("增强 clip 上下限须满足 0 < 下限 ≤ 上限 ≤ 100")
+        job_type = str(job_type or "shot").lower()
+        if job_type not in ("shot", "residual"):
+            raise JobError("作业类型必须是 shot 或 residual")
+        source_files = list(source_files or [source_file])
+        if job_type == "residual" and len(source_files) != 3:
+            raise JobError("残差作业必须提供去噪前、去噪后、噪声残差三个 SGY 文件")
+        readers = [self._get_reader(p, endian) for p in source_files]
+        if job_type == "residual":
+            for i in range(1, len(readers)):
+                ok, reason = readers[0].compatible_with(readers[i])
+                if not ok:
+                    raise JobError(f"残差文件校验失败：第 1 个文件与第 {i + 1} 个文件{reason}")
         r, gs = self._extract(source_file, sort_keys, extract_keys, values, endian)
         gs = self._filter_min_traces(gs, min_traces)
         gs = self._decimate(gs, decimate_n)
@@ -512,11 +577,14 @@ class JobManager:
                               sort_keys, extract_keys, values, clip,
                               aug_lo, aug_hi, created_by, output_dir,
                               min_traces=min_traces, dt_ms=info["dt_ms"],
-                              decimate_n=decimate_n)
+                              decimate_n=decimate_n, job_type=job_type,
+                              source_files=source_files)
         with open(os.path.join(output_dir, "job.json"), "w", encoding="utf-8") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         ns = info["ns"]
-        job = self.register_job(meta, gs, ns, lambda g, r=r: r.get_traces(g.trace_indices))
+        job = self.register_job(
+            meta, gs, ns,
+            lambda g, layer=0, rs=readers: rs[min(max(int(layer), 0), len(rs) - 1)].get_traces(g.trace_indices))
         return job
 
     def load_all(self) -> list[Job]:
@@ -545,8 +613,18 @@ class JobManager:
                 loaded.append(job)
                 continue
             try:
+                source_files = list(meta.get("source_files") or [meta["source_file"]])
+                readers = [self._get_reader(p, meta.get("endian", "auto")) for p in source_files]
+                is_residual = str(meta.get("job_type", "shot") or "shot").lower() in ("residual", "残差")
+                if is_residual:
+                    if len(readers) != 3:
+                        raise JobError("残差作业 source_files 数量不是 3")
+                    for i in range(1, len(readers)):
+                        ok, reason = readers[0].compatible_with(readers[i])
+                        if not ok:
+                            raise JobError(f"残差文件校验失败：第 1 个文件与第 {i + 1} 个文件{reason}")
                 r, gs = self._extract(
-                    meta["source_file"],
+                    source_files[0],
                     [tuple(x) for x in meta["sort_keys"]],
                     [tuple(x) for x in meta["extract_keys"]],
                     _restore_values(meta["values"]), meta.get("endian", "auto"))
@@ -561,8 +639,9 @@ class JobManager:
                     known = False
                 if not known:
                     meta["dt_ms"] = info["dt_ms"]
-                job = self.register_job(meta, gs, info["ns"],
-                                        lambda g, r=r: r.get_traces(g.trace_indices))
+                job = self.register_job(
+                    meta, gs, info["ns"],
+                    lambda g, layer=0, rs=readers: rs[min(max(int(layer), 0), len(rs) - 1)].get_traces(g.trace_indices))
             except Exception:
                 meta = dict(meta); meta["state"] = "broken"
                 job = self.register_job(meta, [], 0, lambda g: np.zeros((0, 0), np.float32))
@@ -882,10 +961,13 @@ class JobManager:
     def save(self, job_id: str, user: str, gather_id: str,
              selection: dict, boxes: dict, is_admin: bool = False,
              save_npy: bool = True, aug_sync: bool | None = None):
-        """保存标注：每张道集写 1 条基础记录(image_path=null) + N_AUG 条增强记录。
+        """保存标注和训练资产；炮集保存增强图，残差保存三层增强图片和 NPY。
 
         增强记录 = 从原始数据按 aug_lo~aug_hi 随机采 N_AUG 个不同 clip 值各渲一张
         images/<gather_id>__clip<值>.png（labels/sentence/regions 与基础一致）。
+        残差记录 = before/after/residual 三层，每层各保存 N_AUG 张 PNG 和一个 NPY，
+        共 3 个 NPY、15 张 PNG；三层使用同一组 clip 值，且每个 clip 档位的
+        显示范围都由 before（去噪前）计算，便于对应比较。
         重开/重复保存先删旧增强记录与其图片再写，避免堆积。
 
         **记录同步落盘，PNG 默认交给后台线程画**（见 AugRenderQueue）：返回时那些图可能
@@ -924,6 +1006,7 @@ class JobManager:
                         holder = u
                 return False, None, [], f"该道集已被 {holder} 持有或标注，不能保存"
 
+            residual = job.job_type == "residual"
             try:
                 clips = sample_clip_values(job.aug_lo, job.aug_hi, N_AUG)
             except ValueError as e:
@@ -936,13 +1019,25 @@ class JobManager:
                 if os.path.isfile(p):
                     os.remove(p)
 
-            raw = job.raw(gather_id)
+            raw = None
             rel_npy = None
-            if save_npy:
-                abs_npy = os.path.join(job.output_dir, job.npy_rel(gather_id))
-                os.makedirs(os.path.dirname(abs_npy), exist_ok=True)
-                np.save(abs_npy, raw)
-                rel_npy = job.npy_rel(gather_id)
+            layer_npy_paths = {}
+            if residual:
+                if save_npy:
+                    for layer in range(job.layer_count):
+                        rel = job.layer_npy_rel(gather_id, layer)
+                        abs_npy = os.path.join(job.output_dir, rel)
+                        os.makedirs(os.path.dirname(abs_npy), exist_ok=True)
+                        np.save(abs_npy, job.raw(gather_id, layer))
+                        layer_npy_paths[job.layer_slug(layer)] = rel
+                rel_npy = layer_npy_paths.get("before")
+            else:
+                raw = job.raw(gather_id)
+                if save_npy:
+                    abs_npy = os.path.join(job.output_dir, job.npy_rel(gather_id))
+                    os.makedirs(os.path.dirname(abs_npy), exist_ok=True)
+                    np.save(abs_npy, raw)
+                    rel_npy = job.npy_rel(gather_id)
 
             meta = job.meta
             # 重开修改/他人覆盖时保留原标注者（spec §5.4）；仅新记录用当前 user
@@ -958,21 +1053,46 @@ class JobManager:
                 "sentence": self.cfg.render_sentence(selection),
                 "regions": regions,
                 "npy_path": rel_npy,
+                "npy_paths": layer_npy_paths if residual else None,
                 "sort_keys": ", ".join(key_str(tuple(k)) for k in meta["sort_keys"]),
                 "extract_key": ranges_label([tuple(k) for k in meta["extract_keys"]]),
                 "source_file": meta["source_file"],
+                "source_files": list(meta.get("source_files") or [meta["source_file"]]),
+                "job_type": meta.get("job_type", "shot"),
                 "annotated_by": annotator,
             }
             # 增强记录**同步**落盘（纯 JSON，几毫秒）：断点续标/进度/重开读的都是
             # labels.jsonl，这些必须立刻正确 —— 晚的只是那几个 PNG。
             aug_records = []
-            for cp in clips:
-                aug_id = f"{gather_id}__clip{cp:g}"
-                aug_rec = dict(base)
-                aug_rec.update({"gather_id": aug_id,
-                                "image_path": Job.aug_image_rel(gather_id, cp),
-                                "augmented_from": gather_id, "clip_percentile": float(cp)})
-                aug_records.append(job.store.upsert(aug_rec))
+            if residual:
+                layer_image_paths = {job.layer_slug(layer): []
+                                     for layer in range(job.layer_count)}
+                base["image_paths"] = layer_image_paths
+                for layer in range(job.layer_count):
+                    slug = job.layer_slug(layer)
+                    for cp in clips:
+                        layer_id = f"{gather_id}__{slug}__clip{cp:g}"
+                        image_path = job.layer_image_rel(gather_id, layer, cp)
+                        layer_image_paths[slug].append(image_path)
+                        layer_rec = dict(base)
+                        layer_rec.update({
+                            "gather_id": layer_id,
+                            "image_path": image_path,
+                            "npy_path": layer_npy_paths.get(slug),
+                            "augmented_from": gather_id,
+                            "layer_index": layer,
+                            "layer_name": job.layer_names[layer],
+                            "clip_percentile": float(cp),
+                        })
+                        aug_records.append(job.store.upsert(layer_rec))
+            else:
+                for cp in clips:
+                    aug_id = f"{gather_id}__clip{cp:g}"
+                    aug_rec = dict(base)
+                    aug_rec.update({"gather_id": aug_id,
+                                    "image_path": Job.aug_image_rel(gather_id, cp),
+                                    "augmented_from": gather_id, "clip_percentile": float(cp)})
+                    aug_records.append(job.store.upsert(aug_rec))
             # 基础记录：仅用于断点续标/进度/重开，无导出图
             base["image_path"] = None
             rec = job.store.upsert(base)
@@ -1000,11 +1120,18 @@ class JobManager:
     def _render_one(job, gather_id: str, rec: dict):
         """渲染一张增强图。返回相对路径；数据读不出来就记日志跳过（不炸后台线程）。"""
         try:
-            raw = job.raw(gather_id)
-            d = apply_pipeline(raw, [{"name": "clip_percentile",
-                                      "params": {"percentile": float(rec["clip_percentile"])}}])
+            layer = rec.get("layer_index")
+            if layer is None:
+                raw = job.raw(gather_id)
+                d = apply_pipeline(raw, [{"name": "clip_percentile",
+                                          "params": {"percentile": float(rec["clip_percentile"])}}])
+                vlim = None
+            else:
+                raw = job.raw(gather_id, int(layer))
+                vlim = clip_bound(job.raw(gather_id, 0), float(rec["clip_percentile"]))
+                d = apply_pipeline(raw, [{"name": "clip_abs", "params": {"vlim": vlim}}])
             rel = rec["image_path"]
-            job._render_png(d, os.path.join(job.output_dir, rel))
+            job._render_png(d, os.path.join(job.output_dir, rel), vlim=vlim)
             return rel
         except Exception:                                # noqa: BLE001
             log.exception("增强图渲染失败：%s", rec.get("gather_id"))

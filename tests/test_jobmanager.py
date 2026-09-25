@@ -849,6 +849,15 @@ class TestBandpassDisplay(unittest.TestCase):
         b = self.job.display_image(self.gid, bandpass=dict(self.FLT))
         self.assertEqual(a, b)
 
+    def test_display_clip_uses_separate_preview_cache(self):
+        a = self.job.display_image(self.gid, clip_percentile=90.0)
+        b = self.job.display_image(self.gid, clip_percentile=99.9)
+        self.assertNotEqual(a, b)
+        self.assertIn("__clip90", os.path.basename(a))
+        self.assertIn("__clip99.9", os.path.basename(b))
+        self.assertTrue(os.path.isfile(a))
+        self.assertTrue(os.path.isfile(b))
+
     def test_incomplete_filter_raises_instead_of_clean_fallback(self):
         """参数不全必须报错，绝不能悄悄给回未滤波的图（点了滤波却看到干净图）。"""
         self.job.display_image(self.gid)                  # 先建好干净图缓存

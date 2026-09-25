@@ -86,7 +86,8 @@ class TestBBoxFeatures(unittest.TestCase):
         self.assertEqual(CFG.validate_selection(sel), [])
         self.assertEqual(set(CFG.to_record_labels(sel)),
                          {"gather_type", "noise_type", "denoise_quality"})
-        self.assertIn("噪声类型异常振幅、混叠噪声", CFG.render_sentence(sel))
+        self.assertIn("这是一个残差，去噪类型是异常振幅、混叠噪声，去噪状况为：噪声残留、信号泄露。",
+                      CFG.render_sentence(sel))
 
     def test_denoise_completed_is_exclusive(self):
         sel = {"集合类型": "残差", "噪声类型": ["面波"],
