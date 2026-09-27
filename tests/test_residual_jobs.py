@@ -50,6 +50,8 @@ class TestResidualJobs(unittest.TestCase):
         _, job = self.create()
         gid = next(g for g in job.gather_ids() if g.endswith("_1"))
         self.assertEqual(job.job_type, "residual")
+        self.assertEqual(os.path.dirname(job.output_dir),
+                         os.path.join(self.jobs_root, "residual"))
         self.assertEqual(job.layer_names, ("去噪前", "去噪后", "噪声残差"))
         self.assertEqual([job.raw(gid, i)[0, 0] for i in range(3)], [10.0, 11.0, 12.0])
         with open(os.path.join(job.output_dir, "job.json"), encoding="utf-8") as fh:
@@ -78,6 +80,20 @@ class TestResidualJobs(unittest.TestCase):
         loaded = restored.get(job_id)
         gid = next(g for g in loaded.gather_ids() if g.endswith("_1"))
         self.assertEqual([loaded.raw(gid, i)[0, 0] for i in range(3)], [10.0, 11.0, 12.0])
+
+    def test_reload_migrates_legacy_residual_directory(self):
+        manager, job = self.create()
+        manager.aug_queue.stop()
+        legacy_dir = os.path.join(self.jobs_root, job.job_id)
+        os.rename(job.output_dir, legacy_dir)
+
+        restored = JobManager(self.jobs_root, CFG, aug_async=False)
+        restored.load_all()
+        loaded = restored.get(job.job_id)
+        self.assertEqual(loaded.output_dir, job.output_dir)
+        self.assertFalse(os.path.exists(legacy_dir))
+        with open(os.path.join(loaded.output_dir, "job.json"), encoding="utf-8") as fh:
+            self.assertEqual(json.load(fh)["output_dir"], loaded.output_dir)
 
     def test_all_residual_layers_use_before_display_scale(self):
         _, job = self.create()

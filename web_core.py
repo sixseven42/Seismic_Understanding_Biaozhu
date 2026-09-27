@@ -211,7 +211,7 @@ def jobs_progress_html(jobs: list[dict]) -> str:
     jobs: JM.list_jobs() 的结构，每项含 job_id/title/state/labeled/total。
     展示每作业：标题+ID、状态、已完成 x/总数 y、百分比、进度条；total=0 防除零。
     """
-    rows = []
+    rows = {"shot": [], "residual": []}
     for j in jobs:
         jid = html.escape(str(j.get("job_id") or ""))
         title = html.escape(str(j.get("title") or "") or jid)
@@ -229,7 +229,8 @@ def jobs_progress_html(jobs: list[dict]) -> str:
             bar_cls = "jp-close"
         else:
             bar_cls = "jp-run"
-        rows.append(
+        job_type = "residual" if j.get("job_type") in ("residual", "残差") else "shot"
+        rows[job_type].append(
             "<tr>"
             f"<td class='jp-title'>{title}<span class='jp-id'>{jid}</span></td>"
             f"<td class='jp-state'>{state_txt}</td>"
@@ -239,8 +240,11 @@ def jobs_progress_html(jobs: list[dict]) -> str:
             f"style='width:{min(100, max(0, pct_i))}%'></div></div></td>"
             "</tr>"
         )
-    if not rows:
+    if not any(rows.values()):
         return "<p class='jp-empty'>暂无作业</p>"
     head = ("<table class='jobs-progress'>"
             "<tr><th>作业</th><th>状态</th><th>已完成</th><th>进度</th><th></th></tr>")
-    return head + "".join(rows) + "</table>"
+    shot = "<tr class='jp-group'><th colspan='5'>炮集作业</th></tr>" + "".join(rows["shot"])
+    residual = "<tr class='jp-group'><th colspan='5'>残差作业</th></tr>" + "".join(rows["residual"])
+    separator = "<tr class='jp-separator'><td colspan='5'><hr></td></tr>"
+    return head + shot + separator + residual + "</table>"

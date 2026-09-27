@@ -222,6 +222,11 @@ def _filter_fields(user: str):
     return tuple(p[k] for k in FILTER_KEYS)
 
 
+def _all_filter_fields(user: str):
+    values = _filter_fields(user)
+    return (*values, *values)
+
+
 def _radio_value(job, gid: str, feat, st: dict):
     rec = job.store.get(gid)
     by_key = (rec.get("labels") or {}) if rec else {}
@@ -308,7 +313,8 @@ def render_display(request: gr.Request) -> str:
     # 面波区「滤波」：状态与 gid 绑定，换道集自动回落到干净图（web_core.active_filter）
     layer = max(0, min(job.layer_count - 1, int(st.get("residual_layer", 0) or 0)))
     st["residual_layer"] = layer
-    base = job.display_image(gid, bandpass=active_filter(st, gid), layer=layer,
+    bandpass = active_filter(st, gid) if job.job_type != "residual" or layer == 1 else None
+    base = job.display_image(gid, bandpass=bandpass, layer=layer,
                              clip_percentile=_display_clip(job, st))
     overlays = []
     boxes = _current_boxes(job, gid, st)
@@ -404,7 +410,7 @@ def show_current(request: gr.Request):
     sel = _selection(job, gid, st)
     sentence = CFG.render_sentence(sel)
     return (img, info, sentence, *_radio_updates(job, gid, st), *box_statuses_of(request),
-            *_filter_fields(user), _display_clip(job, st), _my_total_text(user))
+            *_all_filter_fields(user), _display_clip(job, st), _my_total_text(user))
 
 
 def _anno_idle(msg: str = ""):
@@ -415,7 +421,7 @@ def _anno_idle(msg: str = ""):
     radio 与参数字段保持不动（与旧图一起清掉反而会让用户以为选错了张）。
     """
     return (gr.update(value=None), msg, "", *([gr.update(value=None)] * len(CFG.features)),
-            *(["…"] * len(bbox_feats())), *((gr.skip(),) * len(FILTER_KEYS)),
+            *(["…"] * len(bbox_feats())), *((gr.skip(),) * (2 * len(FILTER_KEYS))),
             gr.skip(), gr.skip())
 
 
@@ -652,6 +658,33 @@ def select_jobs(request: gr.Request, job_ids):
     return (*anno, mine)
 
 
+def select_all_jobs(request: gr.Request):
+    """Select every job visible to this user without discarding an active annotation."""
+    user = _user(request)
+    job_ids = _job_choices(user)
+    st = wstate(user)
+    if st.get("gid") and st.get("job_id") in job_ids:
+        st["job_ids"] = job_ids
+        anno = refresh_anno(request)
+        mine = gr.update(choices=_mine_choices(user, job_ids), value=None)
+        selection = (*anno, mine)
+    else:
+        selection = select_jobs(request, job_ids)
+    return (gr.update(choices=job_ids, value=job_ids), *selection)
+
+
+def selected_jobs_summary(job_ids) -> str:
+    return f"作业：已选 {len(_norm_job_ids(job_ids))} 个"
+
+
+def toggle_job_list(collapsed: bool, job_ids):
+    collapsed = not bool(collapsed)
+    return (collapsed,
+            gr.update(visible=not collapsed),
+            gr.update(value=selected_jobs_summary(job_ids), visible=collapsed),
+            gr.update(value="展开作业" if collapsed else "收起作业"))
+
+
 def _claim_from_pool(request: gr.Request):
     """从当前选中的作业池随机领一张并显示。
 
@@ -727,7 +760,7 @@ def clear_box(request: gr.Request, feat_key: str):
 # ----------------------------------------------------------------------
 def _filter_outputs(request: gr.Request, msg: str, fresh_img: bool):
     """滤波开关的统一输出，**与 anno_outputs 严格同序同长**：
-        (img, info, sentence, *radios, *box_statuses, *4 个滤波参数, clip, 累计)
+        (img, info, sentence, *radios, *box_statuses, *8 个滤波参数, clip, 累计)
 
     滤波只改「图 / 提示 / 参数字段」三处，句子、单选、框状态一律 gr.skip() 保持不动
     （滤波不影响选择）；参数字段回填该作业已存的统一参数（_filter_fields）。
@@ -737,10 +770,10 @@ def _filter_outputs(request: gr.Request, msg: str, fresh_img: bool):
     st = wstate(user)
     n_other = 1 + len(CFG.features) + len(bbox_feats())   # sentence + radios + 框状态
     if not st.get("job_id") or not st.get("gid"):
-        return (gr.skip(), msg, *((gr.skip(),) * (n_other + len(FILTER_KEYS))),
+        return (gr.skip(), msg, *((gr.skip(),) * (n_other + 2 * len(FILTER_KEYS))),
                 gr.skip(), gr.skip())
     img = render_display(request) if fresh_img else gr.skip()
-    return (img, msg, *((gr.skip(),) * n_other), *_filter_fields(user),
+    return (img, msg, *((gr.skip(),) * n_other), *_all_filter_fields(user),
             gr.skip(), gr.skip())
 
 
@@ -757,6 +790,9 @@ def toggle_filter(request: gr.Request, f1, f2, f3, f4):
     if not st.get("gid") or not st.get("job_id"):
         return _filter_outputs(request, "⚠️ 请先领取道集", fresh_img=False)
     job_id, gid = st["job_id"], st["gid"]
+    job = JM.get(job_id)
+    if job.job_type == "residual" and int(st.get("residual_layer", 0) or 0) != 1:
+        return _filter_outputs(request, "⚠️ 请先切换到第 2 张「去噪后」视图", fresh_img=False)
     if active_filter(st, gid) is not None:            # 当前是「滤波中」→ 还原
         JM.renew(job_id, user)
         st["filter"] = None
@@ -764,7 +800,6 @@ def toggle_filter(request: gr.Request, f1, f2, f3, f4):
     params, err = parse_filter(f1, f2, f3, f4)        # 当前是「原始」→ 应用
     if err:
         return _filter_outputs(request, f"⚠️ {err}", fresh_img=False)
-    job = JM.get(job_id)
     if job.dt_ms <= 0:
         return _filter_outputs(
             request, "⚠️ 该作业缺采样间隔（dt_ms），无法滤波；请用新版重建作业",
@@ -950,7 +985,7 @@ def release_current(request: gr.Request):
     st.pop("boxes", None)
     return (gr.update(value=None), "已归还当前道集（回池，可被他人领取）", "",
             *([gr.update(value=None)] * len(CFG.features)), *(["…"] * len(bbox_feats())),
-            *((gr.skip(),) * len(FILTER_KEYS)), gr.skip(), _my_total_text(user))
+            *((gr.skip(),) * (2 * len(FILTER_KEYS))), gr.skip(), _my_total_text(user))
 
 
 def skip_current(request: gr.Request):
@@ -1333,6 +1368,9 @@ ANNO_CSS = """
     padding: 4px 8px; text-align: left; vertical-align: middle;
 }
 .jobs-progress th { font-weight: 600; }
+.jobs-progress .jp-group th { padding-top: 10px; text-align: left; }
+.jobs-progress .jp-separator td { padding: 8px 0; border: 0; }
+.jobs-progress .jp-separator hr { border: 0; border-top: 1px solid var(--border-color-primary); }
 .jobs-progress .jp-id { display: block; font-size: 11px; opacity: .6; }
 .jobs-progress .jp-state, .jobs-progress .jp-count, .jobs-progress .jp-pct {
     white-space: nowrap;
@@ -2332,8 +2370,13 @@ def build_app() -> gr.Blocks:
         # ---------- ② 作业与标注（全体可见） ----------
         with gr.Accordion("② 作业与标注", open=True):
             with gr.Row():
-                job_dd = gr.Dropdown(choices=[], multiselect=True, scale=3,
-                                     label="作业（可多选：从选中的作业池里随机抽道集）")
+                with gr.Column(scale=3, min_width=260):
+                    job_dd = gr.Dropdown(choices=[], multiselect=True,
+                                         label="作业（可多选：从选中的作业池里随机抽道集）")
+                    job_summary = gr.Markdown(selected_jobs_summary([]), visible=False)
+                job_list_collapsed = gr.State(False)
+                btn_toggle_jobs = gr.Button("收起作业", scale=0, min_width=88)
+                btn_select_all = gr.Button("全选作业", scale=0, min_width=88)
                 btn_claim = gr.Button("领取下一张", variant="primary", scale=1)
                 btn_skip = gr.Button("⏭ 跳过此张", scale=1)
                 btn_release = gr.Button("归还此张", scale=1)
@@ -2356,6 +2399,7 @@ def build_app() -> gr.Blocks:
             box_statuses = []
             box_buttons = []   # (feature_key, 清除按钮)
             filter_ui = None   # 面波区「⚙ 滤波」面板（见 FILTER_FEAT_KEY）
+            residual_filter_ui = None
             # 题序固定：1..N = 各选择题（键盘数字键依次作答），N+1.. = 各拉框项（鼠标 Ctrl）
             with gr.Row(elem_id="anno_body"):
                 with gr.Column(scale=3, elem_id="anno_imgcol", min_width=0):
@@ -2382,6 +2426,22 @@ def build_app() -> gr.Blocks:
                             else:
                                 radios.append(gr.Radio(choices=choices, label=label, value=None,
                                                         interactive=(feat.name != "集合类型")))
+                            if feat.key == "denoise_quality":
+                                with gr.Column(elem_id="residual_filter_panel"):
+                                    with gr.Row():
+                                        rf1 = gr.Number(label="f1 低截 (Hz)", value=8.0,
+                                                        minimum=0, scale=1)
+                                        rf2 = gr.Number(label="f2 低通 (Hz)", value=9.0,
+                                                        minimum=0, scale=1)
+                                        rf3 = gr.Number(label="f3 高通 (Hz)", value=120.0,
+                                                        minimum=0, scale=1)
+                                        rf4 = gr.Number(label="f4 高截 (Hz)", value=121.0,
+                                                        minimum=0, scale=1)
+                                    btn_residual_filter = gr.Button(
+                                        "⚙ 去噪后滤波（再次点击还原）", size="sm",
+                                        elem_id="btn-residual-filter")
+                                residual_filter_ui = {"toggle": btn_residual_filter,
+                                                      "nums": (rf1, rf2, rf3, rf4)}
                     # —— 拉框项统一放在所有选择题之后 ——
                     for bi, feat in enumerate(bbox_feats()):
                         with gr.Column(elem_id=f"bx-{feat.key}"):
@@ -2463,11 +2523,18 @@ def build_app() -> gr.Blocks:
                           job_type, residual_before, residual_after, residual_noise],
                          [build_info, job_dd, mgr_job_dd])
 
-        # 尾部 4 个是滤波参数输入框（按作业回填，见 _filter_fields）
+        # 两组输入框共用作业滤波参数：炮集面波区与残差去噪后视图。
         filter_nums = list(filter_ui["nums"]) if filter_ui is not None else []
-        anno_outputs = [cur_img, anno_info, sentence, *radios, *box_statuses, *filter_nums,
+        residual_filter_nums = (list(residual_filter_ui["nums"])
+                                if residual_filter_ui is not None else [])
+        anno_outputs = [cur_img, anno_info, sentence, *radios, *box_statuses,
+                        *filter_nums, *residual_filter_nums,
                         display_clip, my_total_md]
         job_dd.change(select_jobs, job_dd, anno_outputs + [mine_dd])
+        job_dd.change(selected_jobs_summary, job_dd, job_summary)
+        btn_toggle_jobs.click(toggle_job_list, [job_list_collapsed, job_dd],
+                              [job_list_collapsed, job_dd, job_summary, btn_toggle_jobs])
+        btn_select_all.click(select_all_jobs, None, [job_dd, *anno_outputs, mine_dd])
         mine_dd.change(reopen_mine, [job_dd, mine_dd], anno_outputs)
         btn_claim.click(claim_next, job_dd, anno_outputs)
         btn_skip.click(skip_current, None, anno_outputs)
@@ -2493,6 +2560,9 @@ def build_app() -> gr.Blocks:
         # 面波区「⚙ 滤波」单键开关：输出与 anno_outputs 同序（含尾部 4 个参数字段）
         if filter_ui is not None:
             filter_ui["toggle"].click(toggle_filter, filter_nums, anno_outputs)
+        if residual_filter_ui is not None:
+            residual_filter_ui["toggle"].click(
+                toggle_filter, residual_filter_nums, anno_outputs)
 
         btn_resync.click(resync_job, mgr_job_dd, resync_info)
         btn_delete.click(delete_job_click, mgr_job_dd,

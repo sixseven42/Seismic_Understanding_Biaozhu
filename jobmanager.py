@@ -22,6 +22,7 @@ TTL_SECONDS = 30 * 60
 # 每次保存标注固定增强张数：同一道集随机采 N_AUG 个不同 clip 值各渲一张导出图。
 # （用户拍板 v3.6：不再建作业定单个 clip 作为导出，保存即存多张随机 clip 图。）
 N_AUG = 5
+JOB_SUBDIRS = {"shot": "shot", "residual": "residual"}
 
 # 增强图默认后台渲染（见 AugRenderQueue）。测试把它置 False：断言「存完图就在」才稳定，
 # 否则「images/ 应为空」这类断言会被上一张还在后台画的图偶发打脸。
@@ -507,6 +508,50 @@ class JobManager:
             return gs
         return gs[::n]
 
+    @staticmethod
+    def _job_type(meta: dict) -> str:
+        return "residual" if str(meta.get("job_type", "shot")).lower() in ("residual", "残差") else "shot"
+
+    @staticmethod
+    def _write_meta(path: str, meta: dict) -> None:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    def _job_directories(self):
+        """Migrate recognized root-level jobs and yield classified and legacy directories."""
+        os.makedirs(self.jobs_root, exist_ok=True)
+        for subdir in JOB_SUBDIRS.values():
+            os.makedirs(os.path.join(self.jobs_root, subdir), exist_ok=True)
+        for name in sorted(os.listdir(self.jobs_root)):
+            source = os.path.join(self.jobs_root, name)
+            jf = os.path.join(source, "job.json")
+            if not os.path.isfile(jf):
+                continue
+            try:
+                with open(jf, encoding="utf-8") as f:
+                    meta = json.load(f)
+                if not isinstance(meta, dict) or not meta.get("job_id"):
+                    raise ValueError("job.json 缺作业 ID")
+                target = os.path.join(self.jobs_root, JOB_SUBDIRS[self._job_type(meta)], name)
+                if os.path.lexists(target):
+                    log.warning("作业目录迁移目标已存在，保留原目录: %s", source)
+                    continue
+                os.rename(source, target)
+            except (OSError, ValueError, TypeError, KeyError):
+                log.exception("作业目录迁移失败，保留原目录: %s", source)
+        for base in [*(os.path.join(self.jobs_root, d) for d in JOB_SUBDIRS.values()),
+                     self.jobs_root]:
+            for name in sorted(os.listdir(base)):
+                jd = os.path.join(base, name)
+                if os.path.isfile(os.path.join(jd, "job.json")):
+                    yield jd
+
     def _job_meta(self, job_id: str, title: str, path: str, endian: str,
                   sort_keys, extract_keys, values, clip: float,
                   aug_lo: float, aug_hi: float, created_by: str,
@@ -569,9 +614,19 @@ class JobManager:
             limit = int(min_traces or 0)
             raise JobError(
                 "没有抽到任何道集" if limit <= 0 else f"抽到的道集道数都小于 {limit}，无可用道集")
-        job_id = f"{os.path.splitext(os.path.basename(source_file))[0]}__{datetime.now():%Y%m%d%H%M%S}"
-        output_dir = os.path.join(self.jobs_root, job_id)
-        os.makedirs(output_dir, exist_ok=True)
+        base_id = f"{os.path.splitext(os.path.basename(source_file))[0]}__{datetime.now():%Y%m%d%H%M%S}"
+        with self._lock:
+            job_id = base_id
+            suffix = 2
+            while job_id in self._jobs or any(
+                os.path.lexists(os.path.join(self.jobs_root, subdir, job_id))
+                for subdir in JOB_SUBDIRS.values()
+            ) or os.path.lexists(os.path.join(self.jobs_root, job_id)):
+                job_id = f"{base_id}__{suffix}"
+                suffix += 1
+            output_dir = os.path.join(self.jobs_root, JOB_SUBDIRS[job_type], job_id)
+            os.makedirs(os.path.dirname(output_dir), exist_ok=True)
+            os.mkdir(output_dir)
         info = r.info()
         meta = self._job_meta(job_id, title, source_file, endian,
                               sort_keys, extract_keys, values, clip,
@@ -579,8 +634,7 @@ class JobManager:
                               min_traces=min_traces, dt_ms=info["dt_ms"],
                               decimate_n=decimate_n, job_type=job_type,
                               source_files=source_files)
-        with open(os.path.join(output_dir, "job.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
+        self._write_meta(os.path.join(output_dir, "job.json"), meta)
         ns = info["ns"]
         job = self.register_job(
             meta, gs, ns,
@@ -594,19 +648,26 @@ class JobManager:
         用户已拍板「不兼容，一律重建」，避免按单个固定 clip 的旧格式继续标注。
         抽不出数据同样标 broken。
         """
-        if not os.path.isdir(self.jobs_root):
-            os.makedirs(self.jobs_root, exist_ok=True)
         loaded = []
-        for name in sorted(os.listdir(self.jobs_root)):
-            jd = os.path.join(self.jobs_root, name)
+        for jd in self._job_directories():
             jf = os.path.join(jd, "job.json")
-            if not os.path.isfile(jf):
-                continue
             try:
                 with open(jf, encoding="utf-8") as f:
                     meta = json.load(f)
             except Exception:
                 continue
+            if not isinstance(meta, dict) or not meta.get("job_id"):
+                log.error("无效的 job.json，跳过: %s", jf)
+                continue
+            if meta["job_id"] in self._jobs:
+                log.error("重复的作业 ID，保留未加载目录: %s", jd)
+                continue
+            if meta.get("output_dir") != jd:
+                meta["output_dir"] = jd
+                try:
+                    self._write_meta(jf, meta)
+                except OSError:
+                    log.exception("作业目录已迁移，但 job.json 路径更新失败: %s", jd)
             if "aug_lo" not in meta or "aug_hi" not in meta:
                 meta = dict(meta); meta["state"] = "broken"
                 job = self.register_job(meta, [], 0, lambda g: np.zeros((0, 0), np.float32))
@@ -874,6 +935,7 @@ class JobManager:
             labeled = len(job.store.labeled_ids() & ids)
             total = len(ids) or len(job.store.records)  # broken 时以已有记录数兜底展示
         return {"job_id": job.job_id, "title": job.title, "state": job.state,
+                "job_type": job.job_type,
                 "labeled": labeled, "total": total,
                 "created_by": job.meta.get("created_by", ""),
                 "created_at": job.meta.get("created_at", "")}

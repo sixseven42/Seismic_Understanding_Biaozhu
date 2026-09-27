@@ -600,6 +600,7 @@ class TestCreateAndRestore(unittest.TestCase):
         job = m.create_job(self.sgy, [(95, 96), (13, 16)], [(95, 96)], [1, 2], clip=99,
                            title="demo", created_by="boss")
         self.assertEqual(len(job.gather_ids()), 2)
+        self.assertEqual(os.path.dirname(job.output_dir), os.path.join(self.root, "jobs", "shot"))
         jf = os.path.join(job.output_dir, "job.json")
         self.assertTrue(os.path.isfile(jf))
         # 用全新 manager 走启动恢复
@@ -634,6 +635,33 @@ class TestCreateAndRestore(unittest.TestCase):
         info = next(j for j in m3.list_jobs() if j["job_id"] == "legacy__x")
         self.assertEqual(info["state"], "broken")
         self.assertIsNone(m3.claim("legacy__x", "ann1")["gid"])
+
+    def test_load_migrates_root_job_and_preserves_files(self):
+        jobs_root = os.path.join(self.root, "jobs")
+        m = JobManager(jobs_root, CFG)
+        job = m.create_job(self.sgy, [(95, 96), (13, 16)], [(95, 96)], [1, 2],
+                           created_by="boss")
+        legacy = os.path.join(jobs_root, job.job_id)
+        os.rename(job.output_dir, legacy)
+        jf = os.path.join(legacy, "job.json")
+        with open(jf, encoding="utf-8") as f:
+            meta = json.load(f)
+        meta["output_dir"] = legacy
+        with open(jf, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        marker = os.path.join(legacy, "keep.txt")
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write("existing result")
+
+        restored = JobManager(jobs_root, CFG)
+        restored.load_all()
+        moved = restored.get(job.job_id)
+        self.assertEqual(moved.output_dir, job.output_dir)
+        self.assertFalse(os.path.exists(legacy))
+        with open(os.path.join(moved.output_dir, "keep.txt"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "existing result")
+        with open(os.path.join(moved.output_dir, "job.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["output_dir"], moved.output_dir)
 
 class TestCreateMinTraces(unittest.TestCase):
     """建作业时按「道数下限」滤去道数过少的道集。"""

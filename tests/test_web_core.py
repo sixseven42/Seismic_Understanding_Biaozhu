@@ -84,6 +84,20 @@ class TestJobsProgressHtml(unittest.TestCase):
         self.assertNotIn("<inject>", html)
         self.assertIn("&lt;inject&gt;", html)
 
+    def test_groups_shot_above_residual_with_separator(self):
+        jobs = [
+            {"job_id": "residual-a", "job_type": "residual", "title": "残差 A"},
+            {"job_id": "shot-a", "job_type": "shot", "title": "炮集 A"},
+            {"job_id": "residual-b", "job_type": "residual", "title": "残差 B"},
+            {"job_id": "legacy-shot", "title": "旧炮集"},
+        ]
+        markup = jobs_progress_html(jobs)
+        self.assertLess(markup.index("炮集作业"), markup.index("shot-a"))
+        self.assertLess(markup.index("legacy-shot"), markup.index("jp-separator"))
+        self.assertLess(markup.index("jp-separator"), markup.index("残差作业"))
+        self.assertLess(markup.index("残差作业"), markup.index("residual-a"))
+        self.assertLess(markup.index("residual-a"), markup.index("residual-b"))
+
 
 class TestParseFilter(unittest.TestCase):
     """面波区「滤波」按钮的参数校验：0 <= f1 < f2 < f3 < f4。"""

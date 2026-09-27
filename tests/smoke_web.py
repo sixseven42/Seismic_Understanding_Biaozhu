@@ -81,8 +81,8 @@ class SmokeWebFilter(unittest.TestCase):
             return fh.read()
 
     def _anno_arity(self):
-        """anno_outputs：基础显示项 + 各 radio/框状态 + 4 个滤波参数 + clip + 累计。"""
-        return 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4
+        """anno_outputs：基础显示项 + 各 radio/框状态 + 8 个滤波参数 + clip + 累计。"""
+        return 5 + len(CFG.features) + len(web_app.bbox_feats()) + 8
 
     def test_display_clip_is_remembered_within_job(self):
         ann, gid = self._claimed()
@@ -220,6 +220,71 @@ class SmokeWebFilter(unittest.TestCase):
             self.assertNotIn("__flt", a["image_path"])
             self.assertTrue(os.path.isfile(os.path.join(img_dir,
                                                         os.path.basename(a["image_path"]))))
+
+
+class SmokeResidualFilter(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.paths = [os.path.join(self.root, name)
+                      for name in ("before.sgy", "after.sgy", "residual.sgy")]
+        for path in self.paths:
+            write_sgy(path, n_gathers=2, traces_per=8, ns=128)
+        self._orig_jm, self._orig_up = web_app.JM, web_app.UP
+        web_app.JM = web_app.make_jm(os.path.join(self.root, "jobs"))
+        web_app.UP = Uploader({}, dry_run=True)
+        self.job = web_app.JM.create_job(
+            self.paths[0], [(95, 96), (13, 16)], [(95, 96)], [1, 2],
+            job_type="residual", source_files=self.paths, created_by="boss")
+        self.ann = _Req("ann1")
+        web_app.select_jobs(self.ann, [self.job.job_id])
+
+    def tearDown(self):
+        web_app.JM, web_app.UP = self._orig_jm, self._orig_up
+        web_app.WORK.pop("ann1", None)
+
+    def test_filter_only_affects_after_view_and_second_click_restores(self):
+        st = web_app.wstate("ann1")
+        clean_before = web_app.render_display(self.ann)
+        blocked = web_app.toggle_filter(self.ann, 20, 30, 80, 100)
+        self.assertIn("第 2 张", blocked[1])
+        self.assertIsNone(web_app.active_filter(st, st["gid"]))
+        self.assertEqual(web_app.render_display(self.ann), clean_before)
+
+        clean_after = web_app.cycle_residual_next(self.ann)[0]
+        on = web_app.toggle_filter(self.ann, 20, 30, 80, 100)
+        self.assertIn("已应用滤波", on[1])
+        self.assertIn("__layer1", os.path.basename(on[0]))
+        self.assertIn("__flt", os.path.basename(on[0]))
+        self.assertEqual(web_app._all_filter_fields("ann1"),
+                         (20.0, 30.0, 80.0, 100.0) * 2)
+
+        clean_residual = web_app.cycle_residual_next(self.ann)[0]
+        self.assertNotIn("__flt", os.path.basename(clean_residual))
+        self.assertNotIn("__flt", os.path.basename(web_app.cycle_residual_next(self.ann)[0]))
+        self.assertEqual(web_app.render_display(self.ann), clean_before)
+        self.assertEqual(web_app.cycle_residual_next(self.ann)[0], on[0])
+
+        off = web_app.toggle_filter(self.ann, 20, 30, 80, 100)
+        self.assertIn("已还原", off[1])
+        self.assertEqual(off[0], clean_after)
+
+    def test_filter_state_does_not_follow_skipped_gather_or_exports(self):
+        web_app.cycle_residual_next(self.ann)
+        web_app.toggle_filter(self.ann, 20, 30, 80, 100)
+        old_gid = web_app.wstate("ann1")["gid"]
+        web_app.skip_current(self.ann)
+        st = web_app.wstate("ann1")
+        self.assertNotEqual(st["gid"], old_gid)
+        self.assertEqual(st["residual_layer"], 0)
+        self.assertNotIn("__flt", os.path.basename(web_app.cycle_residual_next(self.ann)[0]))
+
+        ok, _, images, err = web_app.JM.save(
+            self.job.job_id, "ann1", st["gid"],
+            {"集合类型": "残差", "噪声类型": ["异常振幅"],
+             "去噪质量": ["去噪完成"]}, {}, aug_sync=True)
+        self.assertTrue(ok, err)
+        self.assertEqual(len(images), 15)
+        self.assertTrue(all("__flt" not in item["image_path"] for item in images))
 
 
 class SmokeJobPool(unittest.TestCase):
@@ -418,7 +483,7 @@ class SmokeNoReassignAndHint(unittest.TestCase):
         out = web_app.claim_next(ann, [self.job.job_id])
         self.assertNotEqual(out[0], gr.skip(), "空态应清空图片，而不是保留上一张")
         # 空态输出也要与 anno_outputs 同长
-        n = 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4
+        n = 5 + len(CFG.features) + len(web_app.bbox_feats()) + 8
         self.assertEqual(len(out), n)
 
     def test_payload_note_empty_when_no_gather(self):
@@ -596,6 +661,51 @@ class SmokeAutoClaimOnJobSelect(unittest.TestCase):
         self.assertEqual(web_app.wstate("ann1")["gid"], gid)
         self.assertEqual(web_app.wstate("ann1")["partial"], {"集合类型": "炮集"})
 
+    def test_select_all_claims_from_all_visible_jobs(self):
+        ann = _Req("ann1")
+        web_app.JM.set_state(self.job_c.job_id, "closed")
+        out = web_app.select_all_jobs(ann)
+        expected = [self.job_a.job_id, self.job_b.job_id]
+        self.assertEqual(out[0]["value"], expected)
+        self.assertEqual(out[0]["choices"], expected)
+        self.assertEqual(web_app.wstate("ann1")["job_ids"], expected)
+        self.assertIsNotNone(web_app.wstate("ann1").get("gid"))
+        self.assertEqual(len(out), 7 + len(CFG.features) + len(web_app.bbox_feats()) + 8)
+
+    def test_select_all_preserves_unsaved_annotation(self):
+        ann = _Req("ann1")
+        web_app.select_jobs(ann, [self.job_a.job_id])
+        st = web_app.wstate("ann1")
+        gid = st["gid"]
+        st["partial"] = {"集合类型": "炮集"}
+        st["boxes"] = {"amplitude_anomaly": {"xyxy": [1, 1, 2, 2]}}
+
+        out = web_app.select_all_jobs(ann)
+        expected = [self.job_a.job_id, self.job_b.job_id, self.job_c.job_id]
+        self.assertEqual(out[0]["value"], expected)
+        self.assertEqual(st["job_ids"], expected)
+        self.assertEqual(st["gid"], gid)
+        self.assertEqual(st["partial"], {"集合类型": "炮集"})
+        self.assertEqual(st["boxes"], {"amplitude_anomaly": {"xyxy": [1, 1, 2, 2]}})
+
+    def test_collapse_hides_names_without_changing_selection(self):
+        ann = _Req("ann1")
+        web_app.select_all_jobs(ann)
+        selected = list(web_app.wstate("ann1")["job_ids"])
+        collapsed, dropdown, summary, button = web_app.toggle_job_list(False, selected)
+        self.assertTrue(collapsed)
+        self.assertFalse(dropdown["visible"])
+        self.assertTrue(summary["visible"])
+        self.assertEqual(summary["value"], "作业：已选 3 个")
+        self.assertEqual(button["value"], "展开作业")
+        self.assertEqual(web_app.wstate("ann1")["job_ids"], selected)
+
+        expanded, dropdown, summary, button = web_app.toggle_job_list(collapsed, selected)
+        self.assertFalse(expanded)
+        self.assertTrue(dropdown["visible"])
+        self.assertFalse(summary["visible"])
+        self.assertEqual(button["value"], "收起作业")
+
     def test_switching_job_claims_there(self):
         ann = _Req("ann1")
         web_app.select_jobs(ann, [self.job_a.job_id])
@@ -626,7 +736,7 @@ class SmokeAutoClaimOnJobSelect(unittest.TestCase):
         self.assertIsNone(web_app.wstate("ann1").get("gid"))
         out = web_app.claim_next(ann, self.job_a.job_id)
         self.assertIsNotNone(web_app.wstate("ann1").get("gid"))
-        self.assertEqual(len(out), 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4)
+        self.assertEqual(len(out), 5 + len(CFG.features) + len(web_app.bbox_feats()) + 8)
 
 
 class SmokeAnnoOutputArity(unittest.TestCase):
@@ -650,8 +760,8 @@ class SmokeAnnoOutputArity(unittest.TestCase):
         web_app.WORK.pop("ann1", None)
 
     def _n_anno(self):
-        # img + info + sentence + 各 radio + 各 bbox 状态 + 4 个滤波参数
-        return 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4
+        # img + info + sentence + 各 radio + 各 bbox 状态 + 两组滤波参数
+        return 5 + len(CFG.features) + len(web_app.bbox_feats()) + 8
 
     def test_anno_events_return_anno_outputs_length(self):
         ann = _Req("ann1")
@@ -722,13 +832,13 @@ class SmokeBackPrevious(unittest.TestCase):
 
     def _save(self, sel=None):
         out = web_app.save_anno(self.ann, *radio_values_for(sel or full_selection()))
-        self.assertEqual(len(out), 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4,
+        self.assertEqual(len(out), 5 + len(CFG.features) + len(web_app.bbox_feats()) + 8,
                          "save_anno 输出长度")
         return self._gid(), out[1]
 
     def _back(self):
         out = web_app.back_previous(self.ann)
-        self.assertEqual(len(out), 5 + len(CFG.features) + len(web_app.bbox_feats()) + 4,
+        self.assertEqual(len(out), 5 + len(CFG.features) + len(web_app.bbox_feats()) + 8,
                          "back_previous 输出长度")
         return out[1]
 
