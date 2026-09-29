@@ -1,0 +1,509 @@
+{
+  "operation": "copy matching *_annot.sgy 240-byte SEG-Y trace headers",
+  "method": "reflink staged copies with directory swap; original directories retained",
+  "target_count": 50,
+  "backup_suffix": ".before_headerfix",
+  "results": [
+    {
+      "area": "01",
+      "field": 21307,
+      "target_filename": "01_21307_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/01_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 37656,
+      "staged_verified": true
+    },
+    {
+      "area": "01",
+      "field": 21325,
+      "target_filename": "01_21325_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/01_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "01",
+      "field": 21359,
+      "target_filename": "01_21359_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/01_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 37488,
+      "staged_verified": true
+    },
+    {
+      "area": "01",
+      "field": 21366,
+      "target_filename": "01_21366_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/01_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "01",
+      "field": 21437,
+      "target_filename": "01_21437_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/01_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "08",
+      "field": 32611,
+      "target_filename": "08_32611_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/08_annot.sgy",
+      "n_traces": 26621,
+      "differing_traces_before": 26621,
+      "differing_bytes_before": 52799,
+      "staged_verified": true
+    },
+    {
+      "area": "08",
+      "field": 32651,
+      "target_filename": "08_32651_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/08_annot.sgy",
+      "n_traces": 26621,
+      "differing_traces_before": 26621,
+      "differing_bytes_before": 52799,
+      "staged_verified": true
+    },
+    {
+      "area": "08",
+      "field": 32691,
+      "target_filename": "08_32691_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/08_annot.sgy",
+      "n_traces": 26620,
+      "differing_traces_before": 26620,
+      "differing_bytes_before": 53240,
+      "staged_verified": true
+    },
+    {
+      "area": "08",
+      "field": 32731,
+      "target_filename": "08_32731_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/08_annot.sgy",
+      "n_traces": 27063,
+      "differing_traces_before": 27063,
+      "differing_bytes_before": 54122,
+      "staged_verified": true
+    },
+    {
+      "area": "08",
+      "field": 32781,
+      "target_filename": "08_32781_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/08_annot.sgy",
+      "n_traces": 26619,
+      "differing_traces_before": 26619,
+      "differing_bytes_before": 53238,
+      "staged_verified": true
+    },
+    {
+      "area": "09",
+      "field": 10,
+      "target_filename": "09_10_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/09_annot.sgy",
+      "n_traces": 9600,
+      "differing_traces_before": 9600,
+      "differing_bytes_before": 19200,
+      "staged_verified": true
+    },
+    {
+      "area": "09",
+      "field": 19,
+      "target_filename": "09_19_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/09_annot.sgy",
+      "n_traces": 9600,
+      "differing_traces_before": 9600,
+      "differing_bytes_before": 19200,
+      "staged_verified": true
+    },
+    {
+      "area": "09",
+      "field": 1,
+      "target_filename": "09_1_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/09_annot.sgy",
+      "n_traces": 9600,
+      "differing_traces_before": 9600,
+      "differing_bytes_before": 19200,
+      "staged_verified": true
+    },
+    {
+      "area": "09",
+      "field": 4,
+      "target_filename": "09_4_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/09_annot.sgy",
+      "n_traces": 9600,
+      "differing_traces_before": 9600,
+      "differing_bytes_before": 19200,
+      "staged_verified": true
+    },
+    {
+      "area": "09",
+      "field": 8,
+      "target_filename": "09_8_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/09_annot.sgy",
+      "n_traces": 9600,
+      "differing_traces_before": 9600,
+      "differing_bytes_before": 19200,
+      "staged_verified": true
+    },
+    {
+      "area": "10",
+      "field": 24345,
+      "target_filename": "10_24345_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/10_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "10",
+      "field": 24389,
+      "target_filename": "10_24389_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/10_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 37488,
+      "staged_verified": true
+    },
+    {
+      "area": "10",
+      "field": 24432,
+      "target_filename": "10_24432_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/10_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 37488,
+      "staged_verified": true
+    },
+    {
+      "area": "10",
+      "field": 24495,
+      "target_filename": "10_24495_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/10_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "10",
+      "field": 24530,
+      "target_filename": "10_24530_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/10_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "11",
+      "field": 7011,
+      "target_filename": "11_7011_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/11_annot.sgy",
+      "n_traces": 29376,
+      "differing_traces_before": 29376,
+      "differing_bytes_before": 58752,
+      "staged_verified": true
+    },
+    {
+      "area": "11",
+      "field": 7042,
+      "target_filename": "11_7042_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/11_annot.sgy",
+      "n_traces": 31104,
+      "differing_traces_before": 31104,
+      "differing_bytes_before": 62208,
+      "staged_verified": true
+    },
+    {
+      "area": "11",
+      "field": 7073,
+      "target_filename": "11_7073_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/11_annot.sgy",
+      "n_traces": 31104,
+      "differing_traces_before": 31104,
+      "differing_bytes_before": 62208,
+      "staged_verified": true
+    },
+    {
+      "area": "11",
+      "field": 7103,
+      "target_filename": "11_7103_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/11_annot.sgy",
+      "n_traces": 31104,
+      "differing_traces_before": 31104,
+      "differing_bytes_before": 62208,
+      "staged_verified": true
+    },
+    {
+      "area": "11",
+      "field": 7133,
+      "target_filename": "11_7133_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/11_annot.sgy",
+      "n_traces": 31104,
+      "differing_traces_before": 31104,
+      "differing_bytes_before": 62208,
+      "staged_verified": true
+    },
+    {
+      "area": "12",
+      "field": 11600231,
+      "target_filename": "12_11600231_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/12_annot.sgy",
+      "n_traces": 12288,
+      "differing_traces_before": 12288,
+      "differing_bytes_before": 24576,
+      "staged_verified": true
+    },
+    {
+      "area": "12",
+      "field": 11600641,
+      "target_filename": "12_11600641_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/12_annot.sgy",
+      "n_traces": 12288,
+      "differing_traces_before": 12288,
+      "differing_bytes_before": 24576,
+      "staged_verified": true
+    },
+    {
+      "area": "12",
+      "field": 11601221,
+      "target_filename": "12_11601221_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/12_annot.sgy",
+      "n_traces": 12288,
+      "differing_traces_before": 12288,
+      "differing_bytes_before": 24576,
+      "staged_verified": true
+    },
+    {
+      "area": "12",
+      "field": 11601501,
+      "target_filename": "12_11601501_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/12_annot.sgy",
+      "n_traces": 12288,
+      "differing_traces_before": 12288,
+      "differing_bytes_before": 24192,
+      "staged_verified": true
+    },
+    {
+      "area": "12",
+      "field": 11601591,
+      "target_filename": "12_11601591_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/12_annot.sgy",
+      "n_traces": 12288,
+      "differing_traces_before": 12288,
+      "differing_bytes_before": 24576,
+      "staged_verified": true
+    },
+    {
+      "area": "13",
+      "field": 2146061,
+      "target_filename": "13_2146061_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/13_annot.sgy",
+      "n_traces": 3072,
+      "differing_traces_before": 3072,
+      "differing_bytes_before": 5888,
+      "staged_verified": true
+    },
+    {
+      "area": "13",
+      "field": 2146121,
+      "target_filename": "13_2146121_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/13_annot.sgy",
+      "n_traces": 3072,
+      "differing_traces_before": 3072,
+      "differing_bytes_before": 6144,
+      "staged_verified": true
+    },
+    {
+      "area": "13",
+      "field": 2146181,
+      "target_filename": "13_2146181_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/13_annot.sgy",
+      "n_traces": 3072,
+      "differing_traces_before": 3072,
+      "differing_bytes_before": 5888,
+      "staged_verified": true
+    },
+    {
+      "area": "13",
+      "field": 2146251,
+      "target_filename": "13_2146251_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/13_annot.sgy",
+      "n_traces": 3072,
+      "differing_traces_before": 3072,
+      "differing_bytes_before": 6144,
+      "staged_verified": true
+    },
+    {
+      "area": "13",
+      "field": 2146291,
+      "target_filename": "13_2146291_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/13_annot.sgy",
+      "n_traces": 3072,
+      "differing_traces_before": 3072,
+      "differing_bytes_before": 6144,
+      "staged_verified": true
+    },
+    {
+      "area": "14",
+      "field": 27811,
+      "target_filename": "14_27811_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/14_annot.sgy",
+      "n_traces": 11704,
+      "differing_traces_before": 11704,
+      "differing_bytes_before": 23142,
+      "staged_verified": true
+    },
+    {
+      "area": "14",
+      "field": 27841,
+      "target_filename": "14_27841_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/14_annot.sgy",
+      "n_traces": 11704,
+      "differing_traces_before": 11704,
+      "differing_bytes_before": 23408,
+      "staged_verified": true
+    },
+    {
+      "area": "14",
+      "field": 27861,
+      "target_filename": "14_27861_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/14_annot.sgy",
+      "n_traces": 11704,
+      "differing_traces_before": 11704,
+      "differing_bytes_before": 23408,
+      "staged_verified": true
+    },
+    {
+      "area": "14",
+      "field": 27941,
+      "target_filename": "14_27941_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/14_annot.sgy",
+      "n_traces": 11704,
+      "differing_traces_before": 11704,
+      "differing_bytes_before": 23142,
+      "staged_verified": true
+    },
+    {
+      "area": "14",
+      "field": 27991,
+      "target_filename": "14_27991_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/14_annot.sgy",
+      "n_traces": 11704,
+      "differing_traces_before": 11704,
+      "differing_bytes_before": 23408,
+      "staged_verified": true
+    },
+    {
+      "area": "16",
+      "field": 43263,
+      "target_filename": "16_43263_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/16_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "16",
+      "field": 43295,
+      "target_filename": "16_43295_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/16_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "16",
+      "field": 43327,
+      "target_filename": "16_43327_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/16_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 37488,
+      "staged_verified": true
+    },
+    {
+      "area": "16",
+      "field": 43357,
+      "target_filename": "16_43357_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/16_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "16",
+      "field": 43378,
+      "target_filename": "16_43378_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/16_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "17",
+      "field": 1674,
+      "target_filename": "17_1674_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/17_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "17",
+      "field": 1715,
+      "target_filename": "17_1715_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/17_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 37488,
+      "staged_verified": true
+    },
+    {
+      "area": "17",
+      "field": 1743,
+      "target_filename": "17_1743_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/17_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 37488,
+      "staged_verified": true
+    },
+    {
+      "area": "17",
+      "field": 1784,
+      "target_filename": "17_1784_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/17_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    },
+    {
+      "area": "17",
+      "field": 1805,
+      "target_filename": "17_1805_blend.sgy",
+      "source": "/home/geoeast/data_in/nanjing/17_annot.sgy",
+      "n_traces": 19008,
+      "differing_traces_before": 19008,
+      "differing_bytes_before": 38016,
+      "staged_verified": true
+    }
+  ],
+  "elapsed_seconds": 2263.14
+}

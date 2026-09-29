@@ -76,9 +76,17 @@ def make_jm(root: str) -> JobManager:
 
 JM = make_jm(JOBS_ROOT)
 UP.start()
-JM.load_all()
-# 补画上次进程被杀时没来得及画的增强图。放后台线程，绝不拖慢启动。
-threading.Thread(target=JM.sweep_missing_aug, name="aug-sweep", daemon=True).start()
+
+
+def _restore_jobs_in_background():
+    """后台恢复历史作业，让 HTTP 服务先监听，避免大数据扫描阻塞启动。"""
+    try:
+        loaded = JM.load_all()
+        print(f"历史作业恢复完成：{len(loaded)} 个", flush=True)
+        # 补画上次进程被杀时没来得及画的增强图；同样不阻塞网页启动。
+        JM.sweep_missing_aug()
+    except Exception as exc:  # noqa: BLE001 —— 恢复失败不能阻止服务上线
+        print(f"历史作业后台恢复失败：{exc}", flush=True)
 
 # 每用户工作态：{username: {"job_ids","job_id","gid","partial","boxes","filter","filter_params"}}
 #   job_ids: 选中的作业（可多个）—— 抽道集时把它们的可领道集摊平后等概率随机抽
@@ -2646,6 +2654,8 @@ def main():
                         head=ANNO_JS,
                         auth_message="多用户地震标注服务：使用 users.yaml 中的账号登录；"
                                      "登录后点右上角「登出 / 切换账号」即可换账号。")
+    threading.Thread(target=_restore_jobs_in_background, name="job-restore",
+                     daemon=True).start()
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

@@ -57,12 +57,16 @@ class SegyReader:
         """
         if not os.path.isfile(path):
             raise SegyReadError(f"文件不存在: {path}")
-        self.path = path
-        self.file_size = os.path.getsize(path)
+        self.path = os.path.abspath(path)
+        self._file = open(self.path, "rb")
+        opened = os.fstat(self._file.fileno())
+        self.file_identity = (
+            opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns
+        )
+        self.file_size = opened.st_size
 
-        with open(path, "rb") as f:
-            self._text_raw = f.read(TEXT_HEADER_SIZE)
-            bh = f.read(BIN_HEADER_SIZE)
+        self._text_raw = self._file.read(TEXT_HEADER_SIZE)
+        bh = self._file.read(BIN_HEADER_SIZE)
         if len(bh) < BIN_HEADER_SIZE:
             raise SegyReadError("文件过小，不是合法的 SEG-Y")
 
@@ -96,10 +100,17 @@ class SegyReader:
         self.n_traces = body // self.trace_bytes
 
         # memmap：二维视图，每行 = 道头+道数据
-        self._raw = np.memmap(
-            path, dtype=np.uint8, mode="r",
-            offset=FILE_HEADER_SIZE, shape=(self.n_traces, self.trace_bytes),
-        )
+        # 使用读取文件头的同一个描述符创建映射，避免路径在两次打开之间
+        # 被原子替换，导致文件头和道数据来自不同 inode。
+        try:
+            self._raw = np.memmap(
+                self._file, dtype=np.uint8, mode="r",
+                offset=FILE_HEADER_SIZE, shape=(self.n_traces, self.trace_bytes),
+            )
+        finally:
+            # memmap 已独立持有映射；普通文件对象无需伴随 reader 常驻。
+            self._file.close()
+            self._file = None
         self._headers = self._raw[:, :HEADER_SIZE]
 
     # ------------------------------------------------------------------
@@ -179,6 +190,21 @@ class SegyReader:
         if hasattr(self, "_raw") and self._raw is not None:
             self._raw._mmap.close()
             self._raw = None
+        if hasattr(self, "_file") and self._file is not None:
+            self._file.close()
+            self._file = None
+
+    def release_cached_pages(self):
+        """释放顺序扫描带入 RSS 的映射页，保留映射供后续按需读取。"""
+        raw = getattr(self, "_raw", None)
+        mmap_obj = getattr(raw, "_mmap", None)
+        madvise = getattr(mmap_obj, "madvise", None)
+        dontneed = getattr(__import__("mmap"), "MADV_DONTNEED", None)
+        if madvise is not None and dontneed is not None:
+            try:
+                madvise(dontneed)
+            except (OSError, ValueError):
+                pass
 
     def compatible_with(self, other: "SegyReader") -> tuple[bool, str]:
         """Check that two SEG-Y files can be displayed trace-for-trace.

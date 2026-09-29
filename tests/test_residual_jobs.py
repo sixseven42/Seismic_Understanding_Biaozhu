@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import json
 import os
+import shutil
 import tempfile
 import unittest
 
@@ -70,6 +71,24 @@ class TestResidualJobs(unittest.TestCase):
             fh.write(b"\x01")
         with self.assertRaisesRegex(JobError, "道头不一致"):
             self.create()
+
+    def test_reader_cache_reopens_atomically_replaced_file(self):
+        manager = JobManager(self.jobs_root, CFG, aug_async=False)
+        stale = manager._get_reader(self.paths[1])
+        stale_inode = stale.file_identity[1]
+        with open(self.paths[1], "r+b") as fh:
+            fh.seek(FILE_HEADER_SIZE + 30)
+            fh.write(b"\x01")
+        replacement = self.paths[1] + ".replacement"
+        shutil.copyfile(self.paths[0], replacement)
+        os.replace(replacement, self.paths[1])
+
+        current = manager._get_reader(self.paths[1])
+        self.assertIsNot(current, stale)
+        self.assertNotEqual(current.file_identity[1], stale_inode)
+        self.assertEqual(current.file_identity[1], os.stat(self.paths[1]).st_ino)
+        baseline = manager._get_reader(self.paths[0])
+        self.assertEqual(baseline.compatible_with(current), (True, ""))
 
     def test_reload_preserves_three_source_provider(self):
         manager, job = self.create()

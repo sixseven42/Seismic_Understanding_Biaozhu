@@ -404,6 +404,9 @@ class JobManager:
         self._locks: dict[str, threading.RLock] = {}
         self._lock = threading.RLock()                  # 注册表级
         self._readers: dict[tuple, object] = {}         # (abspath,endian) -> SegyReader
+        # 记录 reader 打开时对应的文件身份。同一路径下的 SEG-Y 可能会被
+        # 修复脚本用新文件原子替换；只按路径缓存会继续读取已删除的旧 inode。
+        self._reader_files: dict[tuple, tuple[int, int, int, int]] = {}
         # 增强图后台渲染（保存时把 PNG 画图挪出请求，见 AugRenderQueue）
         self.aug_queue = AugRenderQueue(self._render_one)
         self.aug_async = AUG_ASYNC_DEFAULT if aug_async is None else bool(aug_async)
@@ -466,14 +469,31 @@ class JobManager:
             raise JobError(f"作业不存在: {job_id}")
 
     def _get_reader(self, path: str, endian: str = "auto"):
-        key = (os.path.abspath(path), endian)
+        abspath = os.path.abspath(path)
+        key = (abspath, endian)
+
+        def path_identity():
+            stat = os.stat(abspath)
+            return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
         with self._lock:
+            identity = path_identity()
             r = self._readers.get(key)
-            if r is None:
-                from segy_reader import SegyReader
-                r = SegyReader(path, endian=endian)
-                self._readers[key] = r
-            return r
+            if r is not None and self._reader_files.get(key) == identity:
+                return r
+
+            from segy_reader import SegyReader
+            # 修复脚本通常通过 os.replace 原子替换大文件。若替换恰好发生在
+            # 打开期间，则丢弃该 reader 并重试，保证缓存身份与当前路径一致。
+            for _ in range(3):
+                candidate = SegyReader(abspath, endian=endian)
+                identity = path_identity()
+                if candidate.file_identity == identity:
+                    self._readers[key] = candidate
+                    self._reader_files[key] = identity
+                    return candidate
+                candidate.close()
+            raise JobError(f"SEG-Y 文件在读取期间持续被替换，请稍后重试: {abspath}")
 
     def _extract(self, path, sort_keys, extract_keys, values, endian="auto"):
         r = self._get_reader(path, endian)
@@ -608,6 +628,8 @@ class JobManager:
                 if not ok:
                     raise JobError(f"残差文件校验失败：第 1 个文件与第 {i + 1} 个文件{reason}")
         r, gs = self._extract(source_file, sort_keys, extract_keys, values, endian)
+        for reader in readers:
+            reader.release_cached_pages()
         gs = self._filter_min_traces(gs, min_traces)
         gs = self._decimate(gs, decimate_n)
         if not gs:
@@ -689,6 +711,8 @@ class JobManager:
                     [tuple(x) for x in meta["sort_keys"]],
                     [tuple(x) for x in meta["extract_keys"]],
                     _restore_values(meta["values"]), meta.get("endian", "auto"))
+                for reader in readers:
+                    reader.release_cached_pages()
                 gs = self._filter_min_traces(gs, meta.get("min_traces", 0))
                 gs = self._decimate(gs, meta.get("decimate_n", 1))
                 info = r.info()
